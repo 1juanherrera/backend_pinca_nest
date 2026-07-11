@@ -1,0 +1,35 @@
+# === PINCA NestJS — coexistencia con el stack CI4 ===
+# Se conecta a la MISMA red y BD que el backend CodeIgniter 4.
+# La red externa la crea el docker-compose de pinca_backend (nombre por defecto:
+# "pinca_backend_app-network"). Verificá con: docker network ls | grep app-network
+#
+# Levantar: docker compose up -d
+services:
+  nest:
+    build: .
+    container_name: gestor-pinca-nest
+    ports:
+      - '3000:3000'
+    volumes:
+      - .:/usr/src/app
+      - /usr/src/app/node_modules
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      # DB_HOST = nombre del contenedor MySQL en la red compartida
+      DB_HOST: gestor-pinca-db
+      DB_PORT: 3306
+      DB_USER: ${DB_USER:-user}
+      DB_PASSWORD: ${DB_PASSWORD:-password}
+      DB_NAME: ${DB_NAME:-gestorpincadb}
+      CORS_ALLOWED_ORIGIN: http://localhost:5173
+      # ⚠️ TOKEN_SECRET debe ser el MISMO que pinca_backend/.env
+      TOKEN_SECRET: ${TOKEN_SECRET}
+    networks:
+      - pinca-net
+
+networks:
+  # Red externa creada por el stack de CI4. Ajustá el nombre si difiere.
+  pinca-net:
+    external: true
+    name: pinca_backend_app-network

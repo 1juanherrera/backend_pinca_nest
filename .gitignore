@@ -1,0 +1,27 @@
+# dependencies
+/node_modules
+
+# build
+/dist
+*.tsbuildinfo
+
+# env — NUNCA commitear secretos (mismo TOKEN_SECRET que CI4)
+.env
+.env.local
+.env.*.local
+
+# logs
+*.log
+npm-debug.log*
+
+# editor / OS
+.DS_Store
+.idea
+.vscode/*
+!.vscode/extensions.json
+
+# tests
+/coverage
+
+# entidades autogeneradas para revisión (typeorm-model-generator)
+/src/_generated_entities
