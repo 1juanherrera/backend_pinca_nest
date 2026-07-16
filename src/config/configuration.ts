@@ -10,7 +10,13 @@ export const envValidationSchema = Joi.object({
     .valid('development', 'production', 'test')
     .default('development'),
   PORT: Joi.number().default(3000),
-  CORS_ALLOWED_ORIGIN: Joi.string().default('http://localhost:5173'),
+  // En producción es OBLIGATORIO (si no, CORS defaultearía a localhost y bloquearía
+  // el frontend real, arrancando igual → fallo silencioso en runtime). En dev, default.
+  CORS_ALLOWED_ORIGIN: Joi.string().when('NODE_ENV', {
+    is: 'production',
+    then: Joi.required(),
+    otherwise: Joi.string().default('http://localhost:5173'),
+  }),
 
   // Debe coincidir con pinca_backend/.env → TOKEN_SECRET. Sin fallback débil.
   TOKEN_SECRET: Joi.string()

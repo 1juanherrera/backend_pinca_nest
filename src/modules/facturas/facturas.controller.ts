@@ -8,6 +8,7 @@ import {
   Patch,
   Post,
   Put,
+  Query,
 } from '@nestjs/common';
 
 import { FacturasService } from './facturas.service';
@@ -25,8 +26,9 @@ export class FacturasController {
   constructor(private readonly facturas: FacturasService) {}
 
   @Get()
-  findAll() {
-    return this.facturas.findAll();
+  findAll(@Query() query: Record<string, string>) {
+    // Sin `page` → array completo (retrocompat); con `page` → { data, meta, stats }.
+    return this.facturas.findAll(query);
   }
 
   @Get(':id/detalle')

@@ -1,4 +1,5 @@
-import { HttpException, Injectable } from '@nestjs/common';
+import { HttpException, Injectable, Logger } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
 import { DataSource } from 'typeorm';
 
 import { ConfiguracionService } from '../configuracion/configuracion.service';
@@ -29,6 +30,8 @@ const matchNombre = (mpNombre: unknown, ipNombre: unknown): number => {
  */
 @Injectable()
 export class CostosProduccionService {
+  private readonly logger = new Logger(CostosProduccionService.name);
+
   constructor(
     private readonly dataSource: DataSource,
     private readonly cfg: ConfiguracionService,
@@ -36,6 +39,65 @@ export class CostosProduccionService {
 
   private async margenDefault(): Promise<number> {
     return N(await this.cfg.obtener('margen_utilidad_default_pct', 50));
+  }
+
+  /**
+   * Genera/actualiza el snapshot de costos del día para todos los productos con
+   * fórmula activa. Réplica del comando CI4 `php spark snapshot:costos`
+   * (`App\Commands\SnapshotCostos`). Idempotente: UNIQUE(item_general_id, fecha)
+   * → INSERT ... ON DUPLICATE KEY UPDATE. Alimenta el gráfico de evolución
+   * (`GET /costos-produccion/:id/historia`).
+   */
+  async generarSnapshot(): Promise<{ fecha: string; total: number }> {
+    const batch = (await this.getCostosProduccionBatch()) as {
+      productos?: Record<string, unknown>[];
+    };
+    const productos = batch.productos ?? [];
+    // CURDATE() en la BD (dateStrings:true → 'YYYY-MM-DD') para no depender de la TZ del proceso.
+    const fecha: string = (
+      await this.dataSource.query(`SELECT CURDATE() AS f`)
+    )[0].f;
+
+    for (const p of productos) {
+      const mpsTotal = N(p.mps_total);
+      const mpsCubiertas =
+        mpsTotal - ((p.mps_faltantes as unknown[])?.length ?? 0);
+      await this.dataSource.query(
+        `INSERT INTO costos_snapshot
+           (item_general_id, fecha, estado, volumen_base, costo_mp_total, costo_mp_por_unidad,
+            costo_empaque_mod, costo_total, porcentaje_utilidad, precio_venta_calc, mps_total, mps_cubiertas)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           estado=VALUES(estado), volumen_base=VALUES(volumen_base),
+           costo_mp_total=VALUES(costo_mp_total), costo_mp_por_unidad=VALUES(costo_mp_por_unidad),
+           costo_empaque_mod=VALUES(costo_empaque_mod), costo_total=VALUES(costo_total),
+           porcentaje_utilidad=VALUES(porcentaje_utilidad), precio_venta_calc=VALUES(precio_venta_calc),
+           mps_total=VALUES(mps_total), mps_cubiertas=VALUES(mps_cubiertas)`,
+        [
+          N(p.id_item_general), fecha, p.estado, N(p.volumen_base),
+          fNull(p.costo_mp_total), fNull(p.costo_mp_por_unidad), N(p.costo_empaque_mod),
+          fNull(p.costo_total), N(p.porcentaje_utilidad), fNull(p.precio_venta_calc),
+          mpsTotal, mpsCubiertas,
+        ],
+      );
+    }
+    return { fecha, total: productos.length };
+  }
+
+  /**
+   * Snapshot automático mensual (1º de cada mes, 06:00 hora de Colombia).
+   * Reemplaza el cron externo que corría `php spark snapshot:costos` en CI4.
+   */
+  @Cron('0 6 1 * *', { name: 'snapshot-costos-mensual', timeZone: 'America/Bogota' })
+  async snapshotMensual(): Promise<void> {
+    try {
+      const r = await this.generarSnapshot();
+      this.logger.log(
+        `Snapshot mensual de costos generado: ${r.total} producto(s) — fecha ${r.fecha}`,
+      );
+    } catch (e) {
+      this.logger.error(`Snapshot mensual falló: ${(e as Error).message}`);
+    }
   }
 
   // ── GET /costos-produccion ──

@@ -27,17 +27,43 @@ export class DashboardService {
 
   async index(): Promise<Record<string, unknown>> {
     try {
-      const cartera = await this.cartera.resumen();
-      const aging = (await this.cartera.aging()) as {
+      // Las ~13 agregaciones son independientes entre sí → se ejecutan en
+      // PARALELO (antes eran await secuenciales y la latencia se sumaba linealmente).
+      // stats(false): salta duplicados (Levenshtein) — el dashboard debe ser <500ms.
+      const [
+        cartera,
+        agingRaw,
+        sincStats,
+        nowRows,
+        top_deudores,
+        ventas_mes,
+        cotizaciones,
+        ocs_pendientes,
+        mp_criticas,
+        produccion_curso,
+        movimientos_hoy,
+        top_descripciones,
+        rentabilidad,
+      ] = await Promise.all([
+        this.cartera.resumen(),
+        this.cartera.aging(),
+        this.sincronizacion.stats(false),
+        this.dataSource.query(`SELECT DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s') AS g`),
+        this.topDeudores(5),
+        this.ventasMes(),
+        this.cotizacionesPendientes(),
+        this.ocsPendientes(),
+        this.mpCriticas(7, 10),
+        this.produccionEnCurso(),
+        this.movimientosHoy(),
+        this.topDescripcionesMes(5),
+        this.rentabilidadMes(),
+      ]);
+      const aging = agingRaw as {
         total_mora: number;
         grupos: Record<string, { monto: number }>;
       };
-      // stats(false): salta duplicados (Levenshtein) — el dashboard debe ser <500ms.
-      const sincStats = await this.sincronizacion.stats(false);
-
-      const nowRows: { g: string }[] = await this.dataSource.query(
-        `SELECT DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s') AS g`,
-      );
+      const now = nowRows as { g: string }[];
 
       return {
         success: true,
@@ -50,17 +76,17 @@ export class DashboardService {
             d_31_60: aging.grupos.dias_31_60.monto,
             d_60_mas: aging.grupos.dias_60_mas.monto,
           },
-          top_deudores: await this.topDeudores(5),
+          top_deudores,
           sincronizacion: sincStats,
-          ventas_mes: await this.ventasMes(),
-          cotizaciones: await this.cotizacionesPendientes(),
-          ocs_pendientes: await this.ocsPendientes(),
-          mp_criticas: await this.mpCriticas(7, 10),
-          produccion_curso: await this.produccionEnCurso(),
-          movimientos_hoy: await this.movimientosHoy(),
-          top_descripciones: await this.topDescripcionesMes(5),
-          rentabilidad: await this.rentabilidadMes(),
-          generated_at: nowRows[0].g,
+          ventas_mes,
+          cotizaciones,
+          ocs_pendientes,
+          mp_criticas,
+          produccion_curso,
+          movimientos_hoy,
+          top_descripciones,
+          rentabilidad,
+          generated_at: now[0].g,
         },
       };
     } catch (e) {

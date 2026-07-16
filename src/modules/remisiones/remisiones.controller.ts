@@ -23,14 +23,9 @@ export class RemisionesController {
   constructor(private readonly remisiones: RemisionesService) {}
 
   @Get()
-  index(
-    @Query('cliente_id') clienteId?: string,
-    @Query('factura_id') facturaId?: string,
-  ) {
-    return this.remisiones.index(
-      clienteId ? Number(clienteId) : undefined,
-      facturaId ? Number(facturaId) : undefined,
-    );
+  index(@Query() query: Record<string, string>) {
+    // Sin `page` → array completo (retrocompat); con `page` → { data, meta, stats }.
+    return this.remisiones.index(query);
   }
 
   @Get(':id/detalle')

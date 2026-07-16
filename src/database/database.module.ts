@@ -33,6 +33,20 @@ import { TypeOrmModule } from '@nestjs/typeorm';
         //  - evita el corrimiento de día en columnas `date` por timezone
         //  - los datetime salen como "YYYY-MM-DD HH:MM:SS" (formato CI4), no ISO "...Z"
         dateStrings: true,
+        // Pool de conexiones mysql2. El default es connectionLimit=10 sin
+        // timeouts; con endpoints pesados (dashboard, listados) reteniendo
+        // conexiones, ~10 requests concurrentes agotaban el pool y bloqueaban.
+        // Subimos el límite y añadimos timeouts + keep-alive.
+        extra: {
+          connectionLimit: 20,
+          waitForConnections: true,
+          queueLimit: 0,
+          connectTimeout: 15000,
+          enableKeepAlive: true,
+          keepAliveInitialDelay: 10000,
+          maxIdle: 10,
+          idleTimeout: 60000,
+        },
         // Logs de query solo en dev.
         logging: config.get<string>('nodeEnv') === 'development' ? ['error', 'warn'] : ['error'],
       }),

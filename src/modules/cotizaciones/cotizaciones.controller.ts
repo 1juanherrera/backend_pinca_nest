@@ -31,8 +31,9 @@ export class CotizacionesController {
   constructor(private readonly cotizaciones: CotizacionesService) {}
 
   @Get()
-  findAll(@Query('cliente_id') clienteId?: string) {
-    return this.cotizaciones.findAll(clienteId ? Number(clienteId) : undefined);
+  findAll(@Query() query: Record<string, string>) {
+    // Sin `page` → array completo (retrocompat); con `page` → { data, meta, stats }.
+    return this.cotizaciones.findAll(query);
   }
 
   @Get(':id/detalle')

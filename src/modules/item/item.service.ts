@@ -276,17 +276,31 @@ export class ItemService {
       const existsCostos = Number(
         (await m.query(`SELECT COUNT(*) AS n FROM costos_item WHERE item_general_id = ?`, [id]))[0].n,
       );
-      const costos = [
-        data.costo_unitario ?? 0, data.envase ?? 0, data.etiqueta ?? 0, data.plastico ?? 0,
-        data.volumen ?? 1, data.costo_cunete ?? 0, data.costo_tambor ?? 0,
-      ];
+      // Columnas de costo permitidas (whitelist). Sólo se actualizan las que
+      // vienen REALMENTE en el body: antes se usaba `data.x ?? 0` para todas, así
+      // que un PUT parcial que no reenviaba `costo_unitario` lo pisaba con 0
+      // (destruyendo el promedio ponderado que mantiene el motor de capas) y
+      // `volumen` con 1. Ahora las ausentes quedan intactas; `costo_unitario`
+      // sólo se toca si el body lo envía explícitamente.
+      const COST_COLS = [
+        'costo_unitario', 'envase', 'etiqueta', 'plastico',
+        'volumen', 'costo_cunete', 'costo_tambor',
+      ] as const;
       if (existsCostos > 0) {
-        await m.query(
-          `UPDATE costos_item SET costo_unitario=?, envase=?, etiqueta=?, plastico=?, volumen=?,
-                  fecha_calculo=CURDATE(), costo_cunete=?, costo_tambor=? WHERE item_general_id=?`,
-          [...costos, id],
-        );
+        const present = COST_COLS.filter((c) => data[c] !== undefined);
+        if (present.length > 0) {
+          const setSql = present.map((c) => `${c}=?`).join(', ');
+          await m.query(
+            `UPDATE costos_item SET ${setSql}, fecha_calculo=CURDATE() WHERE item_general_id=?`,
+            [...present.map((c) => data[c]), id],
+          );
+        }
       } else {
+        // Ítem nuevo sin fila de costos: se siembra una fila completa con defaults.
+        const costos = [
+          data.costo_unitario ?? 0, data.envase ?? 0, data.etiqueta ?? 0, data.plastico ?? 0,
+          data.volumen ?? 1, data.costo_cunete ?? 0, data.costo_tambor ?? 0,
+        ];
         await m.query(
           `INSERT INTO costos_item (costo_unitario, envase, etiqueta, plastico, volumen, fecha_calculo,
                   costo_cunete, costo_tambor, item_general_id)

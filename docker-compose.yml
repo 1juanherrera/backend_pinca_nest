@@ -1,35 +1,92 @@
-# === PINCA NestJS — coexistencia con el stack CI4 ===
-# Se conecta a la MISMA red y BD que el backend CodeIgniter 4.
-# La red externa la crea el docker-compose de pinca_backend (nombre por defecto:
-# "pinca_backend_app-network"). Verificá con: docker network ls | grep app-network
+# ============================================================================
+# PINCA ERP — Stack UNIFICADO (solo NestJS, sin CI4)
+# ============================================================================
+# Proyecto: pinca-erp. Contenedores: pinca-erp-api / pinca-erp-db / pinca-erp-pma.
+# El backend Nest (pinca-erp-api) sirve la API + el frontend (Opción A) + /uploads.
+# Reusa el MISMO volumen de datos del stack CI4 (`pinca_backend_db_data`) → sin pérdida.
 #
-# Levantar: docker compose up -d
+# Levantar:   docker compose up -d          (todo el stack con un comando)
+# Frontend:   npm run build (Windows) → pinca_frontend/dist → Nest lo sirve en :3009
+# API:        http://localhost:3009/api      ·  phpMyAdmin: http://localhost:8081
+#
+# Variables (TOKEN_SECRET, GEMINI_API_KEY, DB_*) se leen de pinca_backend_nest/.env
+# ============================================================================
+name: pinca-erp
+
 services:
-  nest:
-    build: .
-    container_name: gestor-pinca-nest
-    ports:
-      - '3000:3000'
-    volumes:
-      - .:/usr/src/app
-      - /usr/src/app/node_modules
+  db:
+    image: mysql:8.0
+    container_name: pinca-erp-db
     environment:
-      NODE_ENV: development
-      PORT: 3000
-      # DB_HOST = nombre del contenedor MySQL en la red compartida
-      DB_HOST: gestor-pinca-db
+      MYSQL_DATABASE: ${DB_NAME:-gestorpincadb}
+      MYSQL_USER: ${DB_USER:-user}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-password}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-password}
+    volumes:
+      - pinca_db_data:/var/lib/mysql        # ← MISMA data real que el stack CI4
+    networks:
+      - pinca-net
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', 'localhost', '-u', 'root', '-p${DB_ROOT_PASSWORD:-password}']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    image: pinca-erp-api
+    container_name: pinca-erp-api
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - '3009:3009'
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: 3009
+      DB_HOST: db                       # nombre del servicio en la red del compose
       DB_PORT: 3306
       DB_USER: ${DB_USER:-user}
       DB_PASSWORD: ${DB_PASSWORD:-password}
       DB_NAME: ${DB_NAME:-gestorpincadb}
-      CORS_ALLOWED_ORIGIN: http://localhost:5173
-      # ⚠️ TOKEN_SECRET debe ser el MISMO que pinca_backend/.env
+      CORS_ALLOWED_ORIGIN: ${CORS_ALLOWED_ORIGIN:-http://localhost:5173}
       TOKEN_SECRET: ${TOKEN_SECRET}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      # Nest sirve el SPA desde acá (Opción A). El dist se monta abajo.
+      FRONTEND_DIST: /usr/src/app/frontend-dist
+    volumes:
+      - .:/usr/src/app
+      - /usr/src/app/node_modules
+      # Build del frontend (npm run build en Windows). Si no existe, Nest solo
+      # sirve la API (dev con Vite aparte). Read-only.
+      - ../pinca_frontend/dist:/usr/src/app/frontend-dist:ro
     networks:
       - pinca-net
+    restart: unless-stopped
+
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: pinca-erp-pma
+    depends_on:
+      - db
+    ports:
+      - '8081:80'
+    environment:
+      PMA_HOST: db
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-password}
+    networks:
+      - pinca-net
+    restart: unless-stopped
 
 networks:
-  # Red externa creada por el stack de CI4. Ajustá el nombre si difiere.
   pinca-net:
+    driver: bridge
+
+volumes:
+  # Volumen EXISTENTE con tu data real (lo creó el compose de CI4). external:true
+  # = no lo recrea ni borra; lo reusa tal cual. NUNCA hacer `down -v`.
+  pinca_db_data:
     external: true
-    name: pinca_backend_app-network
+    name: pinca_backend_db_data

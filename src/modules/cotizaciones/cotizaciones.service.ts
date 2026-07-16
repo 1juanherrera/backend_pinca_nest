@@ -35,22 +35,100 @@ export class CotizacionesService {
   ) {}
 
   /** GET /cotizaciones (?cliente_id) → array crudo con JOIN clientes + factura. */
-  findAll(clienteId?: number): Promise<Record<string, unknown>[]> {
-    const params: unknown[] = [];
-    let where = 'WHERE co.deleted_at IS NULL';
-    if (clienteId) {
-      where += ' AND co.cliente_id = ?';
-      params.push(clienteId);
-    }
-    return this.dataSource.query(
-      `SELECT co.*, c.nombre_empresa, c.nombre_encargado, f.numero AS numero_factura
+  /**
+   * Listado de cotizaciones. Igual patrón que FacturasService.findAll:
+   * - SIN `page` → ARRAY completo (retrocompat; respeta `cliente_id`).
+   * - CON `page` → `{ data, meta, stats }` server-side (filtros estado/q/cliente_id;
+   *   stats = KPIs GLOBALES para las FlowCards).
+   */
+  async findAll(
+    query: Record<string, string | undefined> = {},
+  ): Promise<
+    | Record<string, unknown>[]
+    | {
+        data: Record<string, unknown>[];
+        meta: Record<string, number>;
+        stats: Record<string, number>;
+      }
+  > {
+    const N = (x: unknown) => Number(x ?? 0);
+    const baseSelect = `SELECT co.*, c.nombre_empresa, c.nombre_encargado, f.numero AS numero_factura
          FROM cotizaciones co
          LEFT JOIN clientes c ON c.id_clientes = co.cliente_id
-         LEFT JOIN facturas f ON f.id_facturas = co.facturas_id
-         ${where}
-        ORDER BY co.id_cotizaciones DESC`,
-      params,
+         LEFT JOIN facturas f ON f.id_facturas = co.facturas_id`;
+
+    // Retrocompat: sin page → array completo.
+    if (query.page == null) {
+      const where: string[] = ['co.deleted_at IS NULL'];
+      const params: unknown[] = [];
+      if (query.cliente_id) {
+        where.push('co.cliente_id = ?');
+        params.push(Number(query.cliente_id));
+      }
+      return this.dataSource.query(
+        `${baseSelect} WHERE ${where.join(' AND ')} ORDER BY co.id_cotizaciones DESC`,
+        params,
+      );
+    }
+
+    // Paginado + filtros
+    const where: string[] = ['co.deleted_at IS NULL'];
+    const params: unknown[] = [];
+    if (query.estado) {
+      where.push('co.estado = ?');
+      params.push(query.estado);
+    }
+    if (query.cliente_id) {
+      where.push('co.cliente_id = ?');
+      params.push(Number(query.cliente_id));
+    }
+    if (query.q) {
+      where.push(
+        '(co.numero LIKE ? OR c.nombre_empresa LIKE ? OR c.nombre_encargado LIKE ?)',
+      );
+      const like = `%${query.q}%`;
+      params.push(like, like, like);
+    }
+    const whereSql = `WHERE ${where.join(' AND ')}`;
+    const limit = Math.min(Math.max(Number(query.limit) || 20, 1), 200);
+    const page = Math.max(Number(query.page) || 1, 1);
+    const offset = (page - 1) * limit;
+
+    const data: Record<string, unknown>[] = await this.dataSource.query(
+      `${baseSelect} ${whereSql} ORDER BY co.id_cotizaciones DESC LIMIT ? OFFSET ?`,
+      [...params, limit, offset],
     );
+    const total = Number(
+      (
+        await this.dataSource.query(
+          `SELECT COUNT(*) AS n FROM cotizaciones co LEFT JOIN clientes c ON c.id_clientes = co.cliente_id ${whereSql}`,
+          params,
+        )
+      )[0].n,
+    );
+    // KPIs GLOBALES (solo deleted_at) — replican metrics de CotizacionesTab.
+    const s = (
+      await this.dataSource.query(
+        // OJO: el enum real es 'Aceptada' (no 'Aprobada'). Las KPIs "aprobadas"/
+        // "monto_aprobado" (nombres que espera el front) se computan de 'Aceptada'.
+        `SELECT COUNT(*) AS total,
+                COALESCE(SUM(estado='Enviada'),0)  AS enviadas,
+                COALESCE(SUM(estado='Aceptada'),0) AS aprobadas,
+                COALESCE(SUM(CASE WHEN estado='Aceptada' THEN total ELSE 0 END),0) AS monto_aprobado
+           FROM cotizaciones WHERE deleted_at IS NULL`,
+      )
+    )[0];
+
+    return {
+      data,
+      meta: { total, page, limit, pages: Math.ceil(total / limit) || 1 },
+      stats: {
+        total: N(s.total),
+        enviadas: N(s.enviadas),
+        aprobadas: N(s.aprobadas),
+        monto_aprobado: N(s.monto_aprobado),
+      },
+    };
   }
 
   /** GET /cotizaciones/:id → objeto crudo (header + datos cliente). */
@@ -210,8 +288,30 @@ export class CotizacionesService {
 
   /** POST /cotizaciones/:id/convertir → crea factura desde la cotización. */
   async convertir(id: number): Promise<Record<string, unknown>> {
-    const cot = await this.findEntity(id);
     return this.dataSource.transaction(async (m) => {
+      // Lock pesimista sobre la cotización DENTRO de la transacción: evita que
+      // dos requests concurrentes (o un doble-click) generen DOS facturas reales
+      // desde la misma cotización (doble folio DIAN, doble cuenta por cobrar).
+      const locked: Array<{
+        estado: string;
+        cliente_id: number;
+        numero: string;
+        subtotal: number;
+        descuento: number;
+        impuestos: number;
+        retencion: number;
+        total: number;
+      }> = await m.query(
+        `SELECT estado, cliente_id, numero, subtotal, descuento, impuestos, retencion, total
+           FROM cotizaciones
+          WHERE id_cotizaciones = ? AND deleted_at IS NULL
+          FOR UPDATE`,
+        [id],
+      );
+      if (!locked.length) {
+        throw new NotFoundException(`Cotización con ID ${id} no encontrada.`);
+      }
+      const cot = locked[0];
       if (cot.estado === 'Convertida') {
         throw new BadRequestException(
           'Esta cotización ya fue convertida a factura',
@@ -273,10 +373,18 @@ export class CotizacionesService {
         );
       }
 
-      await m.query(
-        `UPDATE cotizaciones SET estado = 'Convertida', facturas_id = ? WHERE id_cotizaciones = ?`,
+      const upd: { affectedRows: number } = await m.query(
+        `UPDATE cotizaciones SET estado = 'Convertida', facturas_id = ?
+          WHERE id_cotizaciones = ? AND estado <> 'Convertida'`,
         [facturaId, id],
       );
+      if (!upd.affectedRows) {
+        // Defensa extra: si otra operación convirtió entre el lock y aquí,
+        // abortamos toda la transacción (no queda factura huérfana).
+        throw new BadRequestException(
+          'La cotización ya fue convertida por otra operación.',
+        );
+      }
 
       const fac: Record<string, unknown>[] = await m.query(
         `SELECT * FROM facturas WHERE id_facturas = ?`,

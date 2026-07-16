@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { ScheduleModule } from '@nestjs/schedule';
 import { APP_GUARD } from '@nestjs/core';
 
 import configuration, { envValidationSchema } from './config/configuration';
@@ -56,6 +57,9 @@ import { HealthController } from './health.controller';
       validationSchema: envValidationSchema,
       validationOptions: { abortEarly: false },
     }),
+    // Cron interno (reemplaza `php spark snapshot:costos` de CI4) — ver
+    // CostosProduccionService.snapshotMensual. Necesario para el cutover de CI4.
+    ScheduleModule.forRoot(),
     DatabaseModule,
     AuthModule,
     // Feature modules migrados (se van agregando de a uno en la coexistencia).

@@ -1,4 +1,5 @@
-import { Controller, Get } from '@nestjs/common';
+import { Controller, Get, HttpStatus, Res } from '@nestjs/common';
+import { Response } from 'express';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { Public } from './common/decorators/public.decorator';
@@ -13,7 +14,7 @@ export class HealthController {
 
   @Public()
   @Get()
-  async check() {
+  async check(@Res({ passthrough: true }) res: Response) {
     let db = false;
     try {
       await this.dataSource.query('SELECT 1');
@@ -21,6 +22,9 @@ export class HealthController {
     } catch {
       db = false;
     }
+    // 503 cuando la BD está caída → un liveness/readiness probe que mira el código
+    // HTTP detecta el degradado (antes devolvía 200 aunque la BD estuviera muerta).
+    res.status(db ? HttpStatus.OK : HttpStatus.SERVICE_UNAVAILABLE);
     return {
       ok: db,
       status: db ? 'ok' : 'degraded',

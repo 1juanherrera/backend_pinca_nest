@@ -38,15 +38,95 @@ export class FacturasService {
 
   // ── Lecturas (raw SQL, shapes exactos de CI4; index/show NO filtran deleted_at) ──
 
-  findAll(): Promise<Record<string, unknown>[]> {
-    return this.dataSource.query(
-      `SELECT f.*, c.nombre_empresa, c.nombre_encargado,
+  /**
+   * Listado de facturas.
+   * - SIN `page` (query vacío) → devuelve el ARRAY completo, igual que siempre
+   *   (retrocompatible: Cartera y cualquier consumidor no migrado siguen andando).
+   * - CON `page` → devuelve paginado server-side `{ data, meta, stats }`:
+   *     · data  = página filtrada (estado/q/cliente_id) + LIMIT/OFFSET
+   *     · meta  = { total (del filtro), page, limit, pages }
+   *     · stats = KPIs GLOBALES (todas las facturas, sin filtro) para las FlowCards
+   */
+  async findAll(
+    query: Record<string, string | undefined> = {},
+  ): Promise<
+    | Record<string, unknown>[]
+    | {
+        data: Record<string, unknown>[];
+        meta: Record<string, number>;
+        stats: Record<string, number>;
+      }
+  > {
+    const baseSelect = `SELECT f.*, c.nombre_empresa, c.nombre_encargado,
               c.numero_documento AS nit_cliente, c.tipo AS cliente_tipo,
               c.ciudad, c.plazo_pago
          FROM facturas f
-         LEFT JOIN clientes c ON c.id_clientes = f.cliente_id
-        ORDER BY f.id_facturas DESC`,
+         LEFT JOIN clientes c ON c.id_clientes = f.cliente_id`;
+
+    // Retrocompatibilidad: sin paginación → array completo (comportamiento histórico).
+    if (query.page == null) {
+      return this.dataSource.query(`${baseSelect} ORDER BY f.id_facturas DESC`);
+    }
+
+    // Filtros (whitelist; valores por ?)
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (query.estado) {
+      where.push('f.estado = ?');
+      params.push(query.estado);
+    }
+    if (query.cliente_id) {
+      where.push('f.cliente_id = ?');
+      params.push(Number(query.cliente_id));
+    }
+    if (query.q) {
+      where.push(
+        '(f.numero LIKE ? OR c.nombre_empresa LIKE ? OR c.nombre_encargado LIKE ? OR c.ciudad LIKE ?)',
+      );
+      const like = `%${query.q}%`;
+      params.push(like, like, like, like);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+    const limit = Math.min(Math.max(Number(query.limit) || 20, 1), 200);
+    const page = Math.max(Number(query.page) || 1, 1);
+    const offset = (page - 1) * limit;
+
+    const data: Record<string, unknown>[] = await this.dataSource.query(
+      `${baseSelect} ${whereSql} ORDER BY f.id_facturas DESC LIMIT ? OFFSET ?`,
+      [...params, limit, offset],
     );
+    const total = Number(
+      (
+        await this.dataSource.query(
+          `SELECT COUNT(*) AS n FROM facturas f LEFT JOIN clientes c ON c.id_clientes = f.cliente_id ${whereSql}`,
+          params,
+        )
+      )[0].n,
+    );
+    // KPIs GLOBALES (sin filtros) — replican metrics de FacturacionTab por estado almacenado.
+    const s = (
+      await this.dataSource.query(
+        `SELECT COUNT(*) AS total,
+                COALESCE(SUM(estado='Pendiente'),0) AS pendiente,
+                COALESCE(SUM(estado='Pagada'),0)    AS pagada,
+                COALESCE(SUM(estado='Vencida'),0)   AS vencida,
+                COALESCE(SUM(CASE WHEN estado='Pendiente' THEN saldo_pendiente ELSE 0 END),0) AS monto_pendiente
+           FROM facturas`,
+      )
+    )[0];
+
+    return {
+      data,
+      meta: { total, page, limit, pages: Math.ceil(total / limit) || 1 },
+      stats: {
+        total: Number(s.total),
+        pendiente: Number(s.pendiente),
+        pagada: Number(s.pagada),
+        vencida: Number(s.vencida),
+        monto_pendiente: Number(s.monto_pendiente),
+      },
+    };
   }
 
   async findOne(id: number): Promise<Record<string, unknown>> {
@@ -103,8 +183,13 @@ export class FacturasService {
 
   /** Recalcula saldo/estado de una factura. Reusado por pagos_cliente y notas_credito. */
   async recalcularSaldo(id: number, m: EntityManager): Promise<void> {
+    // FOR UPDATE como PRIMER statement: bloquea la fila de la factura durante
+    // toda la transacción del caller. Así, aunque un caller de reversa (anular
+    // pago/NC) no la haya lockeado antes, este recálculo serializa contra un
+    // pago concurrente y no puede sobrescribir el saldo con un valor stale
+    // (lost update). Los callers que ya la lockearon simplemente re-usan el lock.
     const fRows: { estado: string; total: string }[] = await m.query(
-      `SELECT estado, total FROM facturas WHERE id_facturas = ? AND deleted_at IS NULL`,
+      `SELECT estado, total FROM facturas WHERE id_facturas = ? AND deleted_at IS NULL FOR UPDATE`,
       [id],
     );
     if (!fRows.length) return;

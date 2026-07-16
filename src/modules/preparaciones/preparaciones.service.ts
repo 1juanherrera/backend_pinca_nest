@@ -288,9 +288,17 @@ export class PreparacionesService {
       cantidad: string;
       costo_unitario: string;
     }[] = await m.query(
+      // LEFT JOIN a la ÚLTIMA fila de costos_item (MAX id) por ítem: si un
+      // ingrediente tuviera >1 fila en costos_item, un JOIN directo lo devolvería
+      // duplicado y el loop de consumo descontaría el stock 2×. Mismo patrón
+      // defensivo que usan getById/costosResumen en este mismo service.
       `SELECT phig.item_general_id, phig.cantidad, COALESCE(ci.costo_unitario, 0) AS costo_unitario
          FROM preparaciones_has_item_general phig
-         LEFT JOIN costos_item ci ON ci.item_general_id = phig.item_general_id
+         LEFT JOIN costos_item ci
+           ON ci.id_costos_item = (
+             SELECT MAX(c2.id_costos_item) FROM costos_item c2
+              WHERE c2.item_general_id = phig.item_general_id
+           )
         WHERE phig.preparaciones_id_preparaciones = ?`,
       [prepId],
     );

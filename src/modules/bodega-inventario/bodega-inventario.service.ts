@@ -70,31 +70,52 @@ export class BodegaInventarioService {
 
     const margenDef = N(await this.cfg.obtener('margen_utilidad_default_pct', 50));
 
-    for (const item of inventario) {
-      item.formulacion_id = iNull(item.formulacion_id);
-      if (item.formulacion_id !== null) {
-        const itemData = (await this.dataSource.query(
-          `SELECT ig.viscosidad, ig.p_g, ig.color, ig.secado, ig.cubrimiento, ig.brillo_60,
-                  COALESCE(NULLIF(ci.volumen,0),1) AS volumen_base, COALESCE(ci.envase,0) AS envase,
-                  COALESCE(ci.etiqueta,0) AS etiqueta, COALESCE(ci.bandeja,0) AS bandeja,
-                  COALESCE(ci.plastico,0) AS plastico, COALESCE(ci.costo_mod,0) AS costo_mod,
-                  COALESCE(ci.porcentaje_utilidad, ${margenDef}) AS porcentaje_utilidad
-             FROM item_general ig LEFT JOIN costos_item ci ON ci.item_general_id = ig.id_item_general
-            WHERE ig.id_item_general = ?`,
-          [item.id_item_general],
-        ))[0];
-        const mps: Record<string, unknown>[] = await this.dataSource.query(
-          `SELECT igf.id_item_general_formulaciones, igf.formulaciones_id,
-                  igf.item_general_id AS materia_prima_id, igf.cantidad,
-                  ig.nombre, ig.codigo, COALESCE(ci.costo_unitario,0) AS costo_unitario,
-                  (igf.cantidad * COALESCE(ci.costo_unitario,0)) AS costo_total,
-                  (SELECT COALESCE(SUM(i.cantidad),0) FROM inventario i WHERE i.item_general_id = ig.id_item_general) AS inventario_cantidad
-             FROM item_general_formulaciones igf
-             INNER JOIN item_general ig ON igf.item_general_id = ig.id_item_general
-             LEFT JOIN costos_item ci ON ig.id_item_general = ci.item_general_id
-            WHERE igf.formulaciones_id = ? ORDER BY ig.nombre ASC`,
-          [item.formulacion_id],
-        );
+    // Normalizar formulacion_id y separar los ítems con fórmula activa.
+    for (const item of inventario) item.formulacion_id = iNull(item.formulacion_id);
+    const conFormula = inventario.filter((it) => it.formulacion_id !== null);
+
+    // Antes: 2 queries POR ítem con fórmula (N+1: una página de 200 ítems ≈ 400
+    // queries). Ahora: 2 queries TOTALES con IN(...) + mapas en memoria.
+    if (conFormula.length > 0) {
+      const itemIds = [...new Set(conFormula.map((it) => Number(it.id_item_general)))];
+      const formIds = [...new Set(conFormula.map((it) => Number(it.formulacion_id)))];
+      const itemPh = itemIds.map(() => '?').join(',');
+      const formPh = formIds.map(() => '?').join(',');
+
+      const itemDatas: Record<string, unknown>[] = await this.dataSource.query(
+        `SELECT ig.id_item_general, ig.viscosidad, ig.p_g, ig.color, ig.secado, ig.cubrimiento, ig.brillo_60,
+                COALESCE(NULLIF(ci.volumen,0),1) AS volumen_base, COALESCE(ci.envase,0) AS envase,
+                COALESCE(ci.etiqueta,0) AS etiqueta, COALESCE(ci.bandeja,0) AS bandeja,
+                COALESCE(ci.plastico,0) AS plastico, COALESCE(ci.costo_mod,0) AS costo_mod,
+                COALESCE(ci.porcentaje_utilidad, ?) AS porcentaje_utilidad
+           FROM item_general ig LEFT JOIN costos_item ci ON ci.item_general_id = ig.id_item_general
+          WHERE ig.id_item_general IN (${itemPh})`,
+        [margenDef, ...itemIds],
+      );
+      const itemDataMap = new Map<number, Record<string, unknown>>();
+      for (const d of itemDatas) itemDataMap.set(Number(d.id_item_general), d);
+
+      const mpsAll: Record<string, unknown>[] = await this.dataSource.query(
+        `SELECT igf.id_item_general_formulaciones, igf.formulaciones_id,
+                igf.item_general_id AS materia_prima_id, igf.cantidad,
+                ig.nombre, ig.codigo, COALESCE(ci.costo_unitario,0) AS costo_unitario,
+                (igf.cantidad * COALESCE(ci.costo_unitario,0)) AS costo_total,
+                (SELECT COALESCE(SUM(i.cantidad),0) FROM inventario i WHERE i.item_general_id = ig.id_item_general) AS inventario_cantidad
+           FROM item_general_formulaciones igf
+           INNER JOIN item_general ig ON igf.item_general_id = ig.id_item_general
+           LEFT JOIN costos_item ci ON ig.id_item_general = ci.item_general_id
+          WHERE igf.formulaciones_id IN (${formPh}) ORDER BY ig.nombre ASC`,
+        formIds,
+      );
+      const mpsMap = new Map<number, Record<string, unknown>[]>();
+      for (const mp of mpsAll) {
+        const fid = Number(mp.formulaciones_id);
+        (mpsMap.get(fid) ?? mpsMap.set(fid, []).get(fid)!).push(mp);
+      }
+
+      for (const item of conFormula) {
+        const itemData = itemDataMap.get(Number(item.id_item_general)) ?? {};
+        const mps = mpsMap.get(Number(item.formulacion_id)) ?? [];
         item.formulacion = {
           item: {
             viscosidad: itemData.viscosidad, p_g: itemData.p_g, color: itemData.color,
@@ -110,9 +131,10 @@ export class BodegaInventarioService {
             inventario_cantidad: N(mp.inventario_cantidad),
           })),
         };
-      } else {
-        item.formulacion = null;
       }
+    }
+    for (const item of inventario) {
+      if (item.formulacion_id === null) item.formulacion = null;
     }
 
     return {

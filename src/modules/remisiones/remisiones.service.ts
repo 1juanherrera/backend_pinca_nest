@@ -52,26 +52,99 @@ export class RemisionesService {
       LEFT JOIN clientes c ON c.id_clientes = r.cliente_id
       LEFT JOIN facturas f ON f.id_facturas = r.facturas_id`;
 
-  /** GET /remisiones (?cliente_id&factura_id) → array crudo (_format). */
+  /**
+   * GET /remisiones. Igual patrón que Facturas/Cotizaciones:
+   * - SIN `page` → ARRAY formateado (retrocompat; respeta cliente_id/factura_id).
+   * - CON `page` → `{ data, meta, stats }` server-side (filtros estado/q/cliente_id;
+   *   stats = KPIs GLOBALES). Enum real: Pendiente | Facturada | Anulada.
+   */
   async index(
-    clienteId?: number,
-    facturaId?: number,
-  ): Promise<Record<string, unknown>[]> {
-    let where = 'WHERE r.deleted_at IS NULL';
+    query: Record<string, string | undefined> = {},
+  ): Promise<
+    | Record<string, unknown>[]
+    | {
+        data: Record<string, unknown>[];
+        meta: Record<string, number>;
+        stats: Record<string, number>;
+      }
+  > {
+    const N = (x: unknown) => Number(x ?? 0);
+
+    // Retrocompat: sin page → array completo formateado.
+    if (query.page == null) {
+      let where = 'WHERE r.deleted_at IS NULL';
+      const params: unknown[] = [];
+      if (query.cliente_id) {
+        where += ' AND r.cliente_id = ?';
+        params.push(Number(query.cliente_id));
+      }
+      if (query.factura_id) {
+        where += ' AND r.facturas_id = ?';
+        params.push(Number(query.factura_id));
+      }
+      const rows: Record<string, unknown>[] = await this.dataSource.query(
+        `${this.SELECT_HEADER} ${where} ORDER BY r.id_remisiones DESC`,
+        params,
+      );
+      return rows.map((r) => this.format(r));
+    }
+
+    // Paginado + filtros
+    const where: string[] = ['r.deleted_at IS NULL'];
     const params: unknown[] = [];
-    if (clienteId) {
-      where += ' AND r.cliente_id = ?';
-      params.push(clienteId);
+    if (query.estado) {
+      where.push('r.estado = ?');
+      params.push(query.estado);
     }
-    if (facturaId) {
-      where += ' AND r.facturas_id = ?';
-      params.push(facturaId);
+    if (query.cliente_id) {
+      where.push('r.cliente_id = ?');
+      params.push(Number(query.cliente_id));
     }
+    if (query.q) {
+      where.push(
+        '(r.numero LIKE ? OR c.nombre_empresa LIKE ? OR c.nombre_encargado LIKE ? OR r.direccion_entrega LIKE ?)',
+      );
+      const like = `%${query.q}%`;
+      params.push(like, like, like, like);
+    }
+    const whereSql = `WHERE ${where.join(' AND ')}`;
+    const limit = Math.min(Math.max(Number(query.limit) || 20, 1), 200);
+    const page = Math.max(Number(query.page) || 1, 1);
+    const offset = (page - 1) * limit;
+
     const rows: Record<string, unknown>[] = await this.dataSource.query(
-      `${this.SELECT_HEADER} ${where} ORDER BY r.id_remisiones DESC`,
-      params,
+      `${this.SELECT_HEADER} ${whereSql} ORDER BY r.id_remisiones DESC LIMIT ? OFFSET ?`,
+      [...params, limit, offset],
     );
-    return rows.map((r) => this.format(r));
+    const data = rows.map((r) => this.format(r));
+    const total = Number(
+      (
+        await this.dataSource.query(
+          `SELECT COUNT(*) AS n FROM remisiones r LEFT JOIN clientes c ON c.id_clientes = r.cliente_id ${whereSql}`,
+          params,
+        )
+      )[0].n,
+    );
+    const s = (
+      await this.dataSource.query(
+        `SELECT COUNT(*) AS total,
+                COALESCE(SUM(estado='Pendiente'),0) AS pendientes,
+                COALESCE(SUM(estado='Facturada'),0) AS facturadas,
+                COALESCE(SUM(estado='Anulada'),0)   AS anuladas
+           FROM remisiones WHERE deleted_at IS NULL`,
+      )
+    )[0];
+
+    return {
+      data,
+      meta: { total, page, limit, pages: Math.ceil(total / limit) || 1 },
+      stats: {
+        total: N(s.total),
+        pendientes: N(s.pendientes),
+        facturadas: N(s.facturadas),
+        anuladas: N(s.anuladas),
+      },
+    };
   }
 
   /** GET /remisiones/:id/detalle → array crudo de líneas (6 claves, cast float). */
@@ -190,9 +263,25 @@ export class RemisionesService {
 
   /** POST /remisiones/:id/convertir → crea factura desde la remisión (con IVA). */
   async convertir(id: number): Promise<Record<string, unknown>> {
-    const rem = await this.repo.findOne({ where: { id_remisiones: id } });
-    if (!rem) throw new NotFoundException(`Remisión con ID ${id} no encontrada.`);
     return this.dataSource.transaction(async (m) => {
+      // Lock pesimista DENTRO de la transacción: evita que dos requests
+      // concurrentes (o doble-click) generen DOS facturas desde la misma
+      // remisión (doble folio DIAN, doble IVA, doble cuenta por cobrar).
+      const locked: Array<{
+        estado: string;
+        cliente_id: number;
+        numero: string;
+      }> = await m.query(
+        `SELECT estado, cliente_id, numero
+           FROM remisiones
+          WHERE id_remisiones = ? AND deleted_at IS NULL
+          FOR UPDATE`,
+        [id],
+      );
+      if (!locked.length) {
+        throw new NotFoundException(`Remisión con ID ${id} no encontrada.`);
+      }
+      const rem = locked[0];
       if (rem.estado === 'Facturada') {
         throw new BadRequestException('Esta remisión ya fue convertida a factura');
       }
@@ -235,10 +324,16 @@ export class RemisionesService {
         );
       }
 
-      await m.query(
-        `UPDATE remisiones SET estado = 'Facturada', facturas_id = ? WHERE id_remisiones = ?`,
+      const upd: { affectedRows: number } = await m.query(
+        `UPDATE remisiones SET estado = 'Facturada', facturas_id = ?
+          WHERE id_remisiones = ? AND estado <> 'Facturada'`,
         [facturaId, id],
       );
+      if (!upd.affectedRows) {
+        throw new BadRequestException(
+          'La remisión ya fue convertida por otra operación.',
+        );
+      }
 
       const fac: Record<string, unknown>[] = await m.query(
         `SELECT * FROM facturas WHERE id_facturas = ?`,
