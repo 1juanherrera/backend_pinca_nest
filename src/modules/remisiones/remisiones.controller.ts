@@ -10,6 +10,7 @@ import {
   Put,
   Query,
 } from '@nestjs/common';
+import { Roles } from '../../common/decorators/roles.decorator';
 
 import { RemisionesService } from './remisiones.service';
 import { CreateRemisionDto, UpdateRemisionDto } from './dto/remision.dto';
@@ -67,6 +68,7 @@ export class RemisionesController {
     };
   }
 
+  @Roles('admin')
   @Delete(':id')
   async remove(@Param('id', ParseIntPipe) id: number) {
     await this.remisiones.remove(id);

@@ -19,6 +19,7 @@ import {
   UpdateCotizacionDto,
 } from './dto/cotizacion.dto';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { Roles } from '../../common/decorators/roles.decorator';
 
 /**
  * Réplica fiel de CotizacionesController (CI4). `convertir` se queda en CI4.
@@ -79,6 +80,7 @@ export class CotizacionesController {
     return { status: 200, message: `Cotización marcada como ${dto.estado}`, data };
   }
 
+  @Roles('admin')
   @Delete(':id')
   async remove(
     @Param('id', ParseIntPipe) id: number,

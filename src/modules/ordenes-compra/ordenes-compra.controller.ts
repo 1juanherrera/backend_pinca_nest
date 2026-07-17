@@ -20,6 +20,7 @@ import {
   UpdateOrdenCompraDto,
 } from './dto/orden-compra.dto';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { Roles } from '../../common/decorators/roles.decorator';
 
 /**
  * Réplica fiel de OrdenesCompraController (CI4) — parte SAFE-NOW.
@@ -96,6 +97,7 @@ export class OrdenesCompraController {
     return { mensaje: `Estado actualizado a ${dto.estado}` };
   }
 
+  @Roles('admin')
   @Delete(':id')
   async remove(
     @Param('id', ParseIntPipe) id: number,

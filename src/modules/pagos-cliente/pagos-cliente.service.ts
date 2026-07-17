@@ -187,7 +187,22 @@ export class PagosClienteService {
         }
       }
 
-      const newId = await this.insertPago(m, { ...dto });
+      // Referencia vacía → NULL: así el índice UNIQUE(facturas_id, numero_referencia)
+      // NO bloquea múltiples pagos legítimos sin referencia (multi-NULL permitido),
+      // pero SÍ frena el doble-submit del MISMO pago con referencia.
+      const ref = (dto.numero_referencia ?? '').toString().trim() || null;
+      let newId: number;
+      try {
+        newId = await this.insertPago(m, { ...dto, numero_referencia: ref });
+      } catch (e) {
+        const err = e as { code?: string; errno?: number };
+        if (err?.code === 'ER_DUP_ENTRY' || err?.errno === 1062) {
+          throw new BadRequestException(
+            'Ya existe un pago con esa referencia para esta factura (¿se envió dos veces?).',
+          );
+        }
+        throw e;
+      }
       if (facturaId) await this.facturas.recalcularSaldo(facturaId, m);
       return newId;
     });

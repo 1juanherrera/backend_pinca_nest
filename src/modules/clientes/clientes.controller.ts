@@ -15,6 +15,7 @@ import {
 import { ClientesService } from './clientes.service';
 import { CreateClienteDto, UpdateClienteDto } from './dto/cliente.dto';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { Roles } from '../../common/decorators/roles.decorator';
 
 /** Réplica fiel de ClientesController (CI4). */
 @Controller('clientes')
@@ -48,6 +49,7 @@ export class ClientesController {
     return { mensaje: `Cliente con ID ${id} actualizado correctamente`, data: dto };
   }
 
+  @Roles('admin')
   @Delete(':id')
   async remove(
     @Param('id', ParseIntPipe) id: number,

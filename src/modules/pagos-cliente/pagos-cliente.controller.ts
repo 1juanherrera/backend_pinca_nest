@@ -9,6 +9,7 @@ import {
   Put,
   Query,
 } from '@nestjs/common';
+import { Roles } from '../../common/decorators/roles.decorator';
 
 import { PagosClienteService } from './pagos-cliente.service';
 import { CreatePagoDto, UpdatePagoDto } from './dto/pago.dto';
@@ -38,6 +39,7 @@ export class PagosClienteController {
     return this.pagos.update(id, dto);
   }
 
+  @Roles('admin')
   @Delete(':id')
   remove(@Param('id', ParseIntPipe) id: number) {
     return this.pagos.remove(id);

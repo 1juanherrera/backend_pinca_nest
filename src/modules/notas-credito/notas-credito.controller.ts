@@ -8,6 +8,7 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
+import { Roles } from '../../common/decorators/roles.decorator';
 
 import { NotasCreditoService } from './notas-credito.service';
 import { CreateNotaCreditoDto } from './dto/nota-credito.dto';
@@ -38,6 +39,7 @@ export class NotasCreditoController {
     return this.notas.create(dto);
   }
 
+  @Roles('admin')
   @Patch(':id/anular')
   anular(@Param('id', ParseIntPipe) id: number) {
     return this.notas.anular(id);

@@ -19,6 +19,7 @@ import {
   UpdateFacturaDto,
 } from './dto/factura.dto';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { Roles } from '../../common/decorators/roles.decorator';
 
 /** Réplica fiel de FacturasController (CI4). */
 @Controller('facturas')
@@ -99,6 +100,7 @@ export class FacturasController {
     return { status: 200, message: `Factura marcada como ${dto.estado}`, data };
   }
 
+  @Roles('admin')
   @Delete(':id')
   async remove(
     @Param('id', ParseIntPipe) id: number,
