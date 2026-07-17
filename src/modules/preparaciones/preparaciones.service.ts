@@ -555,9 +555,48 @@ export class PreparacionesService {
   async getAll(
     page: number,
     limit: number,
-  ): Promise<{ data: Record<string, unknown>[]; meta: Record<string, number> }> {
+    filtros: Record<string, string | undefined> = {},
+  ): Promise<{
+    data: Record<string, unknown>[];
+    meta: Record<string, number>;
+    stats: Record<string, number>;
+    itemsFiltro: Array<{ value: string; label: string }>;
+  }> {
+    // Filtros server-side (antes se filtraba TODO en el navegador sobre solo 50 filas).
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (filtros.estado && ESTADO_REV[filtros.estado] !== undefined) {
+      where.push('p.estado = ?');
+      params.push(ESTADO_REV[filtros.estado]);
+    }
+    if (filtros.item) {
+      where.push('p.item_general_id = ?');
+      params.push(filtros.item);
+    }
+    if (filtros.search) {
+      where.push('(ig.nombre LIKE ? OR ig.codigo LIKE ?)');
+      const t = `%${filtros.search}%`;
+      params.push(t, t);
+    }
+    if (filtros.desde) {
+      where.push('DATE(p.fecha_creacion) >= ?');
+      params.push(filtros.desde);
+    }
+    if (filtros.hasta) {
+      where.push('DATE(p.fecha_creacion) <= ?');
+      params.push(filtros.hasta);
+    }
+    const whereSql = where.length
+      ? 'WHERE ' + where.join(' AND ')
+      : '';
+    const joinWhere = `FROM preparaciones p
+         INNER JOIN item_general ig ON ig.id_item_general = p.item_general_id
+         INNER JOIN unidad u ON u.id_unidad = p.unidad_id
+        ${whereSql}`;
+
     const totalRows: { n: number }[] = await this.dataSource.query(
-      `SELECT COUNT(*) AS n FROM preparaciones`,
+      `SELECT COUNT(*) AS n ${joinWhere}`,
+      params,
     );
     const total = Number(totalRows[0].n);
     const offset = (page - 1) * limit;
@@ -566,12 +605,31 @@ export class PreparacionesService {
               ig.nombre AS item_nombre, ig.codigo AS item_codigo,
               u.nombre AS unidad_nombre, u.escala, p.cantidad, p.observaciones,
               p.estado, p.fecha_creacion, p.fecha_inicio, p.fecha_fin
-         FROM preparaciones p
-         INNER JOIN item_general ig ON ig.id_item_general = p.item_general_id
-         INNER JOIN unidad u ON u.id_unidad = p.unidad_id
+         ${joinWhere}
         ORDER BY p.fecha_creacion DESC LIMIT ? OFFSET ?`,
-      [limit, offset],
+      [...params, limit, offset],
     );
+
+    // KPIs globales por estado (independientes de filtros, igual que ProduccionKpis).
+    const [st] = (await this.dataSource.query(
+      `SELECT COUNT(*) AS total,
+              SUM(estado = 0) AS pendiente,
+              SUM(estado = 1) AS en_proceso,
+              SUM(estado = 2) AS completada,
+              SUM(estado = 3) AS cancelada
+         FROM preparaciones`,
+    )) as Array<Record<string, unknown>>;
+
+    // Ítems distintos con órdenes (para el <select> de filtro; antes se derivaba
+    // del fetch completo en el navegador). Lista acotada, barata.
+    const itemsFiltro: Array<{ value: string; label: string }> = (
+      (await this.dataSource.query(
+        `SELECT DISTINCT p.item_general_id AS value, ig.nombre AS label
+           FROM preparaciones p
+           INNER JOIN item_general ig ON ig.id_item_general = p.item_general_id
+          ORDER BY ig.nombre ASC`,
+      )) as Array<Record<string, unknown>>
+    ).map((r) => ({ value: String(r.value), label: String(r.label) }));
     const data = rows.map((r) => {
       const escala = Number(r.escala);
       const cantidad = Number(r.cantidad);
@@ -593,7 +651,15 @@ export class PreparacionesService {
     });
     return {
       data,
-      meta: { total, page, limit, pages: Math.ceil(total / limit) },
+      meta: { total, page, limit, pages: Math.ceil(total / limit) || 1 },
+      stats: {
+        total: Number(st?.total ?? 0),
+        pendiente: Number(st?.pendiente ?? 0),
+        en_proceso: Number(st?.en_proceso ?? 0),
+        completada: Number(st?.completada ?? 0),
+        cancelada: Number(st?.cancelada ?? 0),
+      },
+      itemsFiltro,
     };
   }
 

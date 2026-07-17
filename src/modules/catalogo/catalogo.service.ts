@@ -37,13 +37,29 @@ export class CatalogoService {
     private readonly dataSource: DataSource,
   ) {}
 
-  /** GET /catalogo → array crudo (query idéntica a CatalogoModel::listar; NO filtra deleted_at, como CI4). */
-  listar(
+  /**
+   * GET /catalogo
+   * Retrocompatible: sin `page` → array crudo (idéntico a CatalogoModel::listar).
+   * Con `page` → `{ data, meta, stats }` paginado server-side (mismo patrón que
+   * facturas/cotizaciones/…). `stats` = counts GLOBALES por tipo para las tabs
+   * (all/producto/materia/insumo), independientes de los filtros (igual que hoy,
+   * que los calcula sobre el fetch completo). NO filtra deleted_at, como CI4.
+   */
+  async listar(
     tipo?: number,
     categoriaId?: number,
     busqueda?: string,
-  ): Promise<Record<string, unknown>[]> {
-    let sql = `
+    page?: number,
+    limitInput?: number,
+  ): Promise<
+    | Record<string, unknown>[]
+    | {
+        data: Record<string, unknown>[];
+        meta: { total: number; page: number; limit: number; pages: number };
+        stats: Record<string, number>;
+      }
+  > {
+    const select = `
       SELECT ig.id_item_general, ig.nombre, ig.codigo, ig.tipo, ig.categoria_id,
              ig.unidad_id, ig.unidad_almacenaje_id,
              ig.viscosidad, ig.p_g, ig.color, ig.brillo_60,
@@ -68,24 +84,68 @@ export class CatalogoService {
           SELECT item_general_id, COUNT(*) AS total_proveedores
             FROM item_proveedor WHERE disponible = 1
            GROUP BY item_general_id
-        ) prov ON prov.item_general_id = ig.id_item_general
-       WHERE 1=1`;
+        ) prov ON prov.item_general_id = ig.id_item_general`;
+
+    const where: string[] = ['1=1'];
     const params: unknown[] = [];
     if (tipo !== undefined) {
-      sql += ' AND ig.tipo = ?';
+      where.push('ig.tipo = ?');
       params.push(tipo);
     }
     if (categoriaId !== undefined) {
-      sql += ' AND ig.categoria_id = ?';
+      where.push('ig.categoria_id = ?');
       params.push(categoriaId);
     }
     if (busqueda) {
-      sql += ' AND (UPPER(ig.nombre) LIKE ? OR UPPER(ig.codigo) LIKE ?)';
+      where.push('(UPPER(ig.nombre) LIKE ? OR UPPER(ig.codigo) LIKE ?)');
       const t = '%' + busqueda.toUpperCase() + '%';
       params.push(t, t);
     }
-    sql += ' ORDER BY ig.nombre ASC';
-    return this.dataSource.query(sql, params);
+    const whereSql = 'WHERE ' + where.join(' AND ');
+
+    // Modo legacy: array completo.
+    if (!page) {
+      return this.dataSource.query(
+        `${select} ${whereSql} ORDER BY ig.nombre ASC`,
+        params,
+      );
+    }
+
+    // Modo paginado.
+    const p = page > 0 ? page : 1;
+    const limit = Math.min(200, Math.max(1, limitInput || 25));
+    const offset = (p - 1) * limit;
+
+    const [countRow] = (await this.dataSource.query(
+      `SELECT COUNT(*) AS total FROM item_general ig ${whereSql}`,
+      params,
+    )) as Array<{ total: number }>;
+    const total = Number(countRow?.total ?? 0);
+
+    const data: Record<string, unknown>[] = await this.dataSource.query(
+      `${select} ${whereSql} ORDER BY ig.nombre ASC LIMIT ? OFFSET ?`,
+      [...params, limit, offset],
+    );
+
+    // Counts globales por tipo (para las tabs), sin filtros.
+    const [s] = (await this.dataSource.query(
+      `SELECT COUNT(*) AS all_count,
+              SUM(tipo = 0) AS tipo0,
+              SUM(tipo = 1) AS tipo1,
+              SUM(tipo = 2) AS tipo2
+         FROM item_general`,
+    )) as Array<Record<string, unknown>>;
+
+    return {
+      data,
+      meta: { total, page: p, limit, pages: Math.ceil(total / limit) || 1 },
+      stats: {
+        all: Number(s?.all_count ?? 0),
+        tipo0: Number(s?.tipo0 ?? 0),
+        tipo1: Number(s?.tipo1 ?? 0),
+        tipo2: Number(s?.tipo2 ?? 0),
+      },
+    };
   }
 
   /** GET /catalogo/:id → objeto con proveedores[] + stock_por_bodega[] + stock_total. */

@@ -28,11 +28,15 @@ export class CatalogoController {
     @Query('tipo') tipo?: string,
     @Query('categoria_id') categoriaId?: string,
     @Query('q') q?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
   ) {
     return this.catalogo.listar(
       tipo !== undefined && tipo !== '' ? Number(tipo) : undefined,
       categoriaId !== undefined && categoriaId !== '' ? Number(categoriaId) : undefined,
       q,
+      page !== undefined && page !== '' ? Number(page) : undefined,
+      limit !== undefined && limit !== '' ? Number(limit) : undefined,
     );
   }
 

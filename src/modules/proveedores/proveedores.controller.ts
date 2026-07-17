@@ -9,6 +9,7 @@ import {
   ParseIntPipe,
   Post,
   Put,
+  Query,
 } from '@nestjs/common';
 
 import { ProveedoresService } from './proveedores.service';
@@ -26,8 +27,8 @@ export class ProveedoresController {
   constructor(private readonly proveedores: ProveedoresService) {}
 
   @Get()
-  findAll() {
-    return this.proveedores.findAll();
+  findAll(@Query() query: Record<string, string>) {
+    return this.proveedores.findAll(query);
   }
 
   @Post()

@@ -69,11 +69,27 @@ export class FacturasService {
     }
 
     // Filtros (whitelist; valores por ?)
+    // Modo `efectivo` (vista Cartera): el estado se calcula por mora/saldo en SQL,
+    // réplica EXACTA de getEstadoEfectivo() del front (carteraService.js). Así el
+    // filtro y los KPIs coinciden con lo que el usuario ve, sin depender de que el
+    // campo `estado` almacenado esté al día.
+    const efectivo = query.efectivo === '1' || query.efectivo === 'true';
+    const effCase = `CASE
+        WHEN f.estado = 'Pagada' OR f.saldo_pendiente <= 0 THEN 'Pagada'
+        WHEN DATEDIFF(CURDATE(), f.fecha_vencimiento) > 0 THEN 'Vencida'
+        WHEN f.saldo_pendiente < f.total THEN 'Parcial'
+        ELSE 'Pendiente' END`;
+
     const where: string[] = [];
     const params: unknown[] = [];
     if (query.estado) {
-      where.push('f.estado = ?');
+      where.push(efectivo ? `${effCase} = ?` : 'f.estado = ?');
       params.push(query.estado);
+    }
+    if (query.sector) {
+      // c.tipo (1 Personal / 2 Empresa / 3 Ferretería) — filtro por sector de Cartera.
+      where.push('c.tipo = ?');
+      params.push(Number(query.sector));
     }
     if (query.cliente_id) {
       where.push('f.cliente_id = ?');
@@ -104,28 +120,50 @@ export class FacturasService {
         )
       )[0].n,
     );
-    // KPIs GLOBALES (sin filtros) — replican metrics de FacturacionTab por estado almacenado.
-    const s = (
-      await this.dataSource.query(
-        `SELECT COUNT(*) AS total,
-                COALESCE(SUM(estado='Pendiente'),0) AS pendiente,
-                COALESCE(SUM(estado='Pagada'),0)    AS pagada,
-                COALESCE(SUM(estado='Vencida'),0)   AS vencida,
-                COALESCE(SUM(CASE WHEN estado='Pendiente' THEN saldo_pendiente ELSE 0 END),0) AS monto_pendiente
-           FROM facturas`,
-      )
-    )[0];
+    // KPIs GLOBALES (sin filtros). En modo `efectivo` (Cartera) por estado por mora;
+    // si no, por estado ALMACENADO (FacturacionTab).
+    const s = efectivo
+      ? (
+          await this.dataSource.query(
+            `SELECT COUNT(*) AS total,
+                    COALESCE(SUM(${effCase} = 'Pendiente'),0) AS pendiente,
+                    COALESCE(SUM(${effCase} = 'Pagada'),0)    AS pagada,
+                    COALESCE(SUM(${effCase} = 'Vencida'),0)   AS vencida,
+                    COALESCE(SUM(${effCase} = 'Parcial'),0)   AS parcial,
+                    COALESCE(SUM(CASE WHEN ${effCase} <> 'Pagada' THEN f.saldo_pendiente ELSE 0 END),0) AS saldo_por_cobrar
+               FROM facturas f`,
+          )
+        )[0]
+      : (
+          await this.dataSource.query(
+            `SELECT COUNT(*) AS total,
+                    COALESCE(SUM(estado='Pendiente'),0) AS pendiente,
+                    COALESCE(SUM(estado='Pagada'),0)    AS pagada,
+                    COALESCE(SUM(estado='Vencida'),0)   AS vencida,
+                    COALESCE(SUM(CASE WHEN estado='Pendiente' THEN saldo_pendiente ELSE 0 END),0) AS monto_pendiente
+               FROM facturas`,
+          )
+        )[0];
 
     return {
       data,
       meta: { total, page, limit, pages: Math.ceil(total / limit) || 1 },
-      stats: {
-        total: Number(s.total),
-        pendiente: Number(s.pendiente),
-        pagada: Number(s.pagada),
-        vencida: Number(s.vencida),
-        monto_pendiente: Number(s.monto_pendiente),
-      },
+      stats: efectivo
+        ? {
+            total: Number(s.total),
+            pendiente: Number(s.pendiente),
+            pagada: Number(s.pagada),
+            vencida: Number(s.vencida),
+            parcial: Number(s.parcial),
+            saldo_por_cobrar: Number(s.saldo_por_cobrar),
+          }
+        : {
+            total: Number(s.total),
+            pendiente: Number(s.pendiente),
+            pagada: Number(s.pagada),
+            vencida: Number(s.vencida),
+            monto_pendiente: Number(s.monto_pendiente),
+          },
     };
   }
 

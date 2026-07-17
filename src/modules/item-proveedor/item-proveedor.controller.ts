@@ -8,6 +8,7 @@ import {
   Patch,
   Post,
   Put,
+  Query,
 } from '@nestjs/common';
 
 import { ItemProveedorService } from './item-proveedor.service';
@@ -18,8 +19,8 @@ export class ItemProveedorController {
   constructor(private readonly svc: ItemProveedorService) {}
 
   @Get()
-  index() {
-    return this.svc.getItemProveedores();
+  index(@Query() query: Record<string, string>) {
+    return this.svc.getItemProveedores(query);
   }
 
   @Get(':id')

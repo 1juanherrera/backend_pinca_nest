@@ -39,8 +39,44 @@ export class ClientesService {
     return out;
   }
 
-  findAll(): Promise<Cliente[]> {
-    return this.repo.find({ order: { id_clientes: 'ASC' } });
+  /**
+   * GET /clientes
+   * Retrocompatible: sin `page` → array crudo (order id ASC, como antes). Con `page`
+   * → { data, meta } paginado server-side. Filtro `q` (empresa|encargado|documento|
+   * email|ciudad). QueryBuilder respeta el soft-delete (@DeleteDateColumn).
+   */
+  async findAll(
+    query: Record<string, string> = {},
+  ): Promise<
+    | Cliente[]
+    | {
+        data: Cliente[];
+        meta: { total: number; page: number; limit: number; pages: number };
+      }
+  > {
+    const qb = this.repo.createQueryBuilder('c').orderBy('c.id_clientes', 'ASC');
+    if (query.q) {
+      qb.andWhere(
+        '(c.nombre_empresa LIKE :q OR c.nombre_encargado LIKE :q OR CAST(c.numero_documento AS CHAR) LIKE :q OR c.email LIKE :q OR c.ciudad LIKE :q)',
+        { q: `%${query.q}%` },
+      );
+    }
+
+    if (!query.page) {
+      return qb.getMany();
+    }
+
+    const page = Math.max(1, parseInt(query.page, 10) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(query.limit, 10) || 20));
+    const [data, total] = await qb
+      .skip((page - 1) * limit)
+      .take(limit)
+      .getManyAndCount();
+
+    return {
+      data,
+      meta: { total, page, limit, pages: Math.ceil(total / limit) || 1 },
+    };
   }
 
   async findOne(id: number): Promise<Cliente> {

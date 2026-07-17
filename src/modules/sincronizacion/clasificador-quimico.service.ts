@@ -5,14 +5,16 @@ import { Injectable } from '@nestjs/common';
  *
  * Clasifica materias primas / insumos por IDENTIDAD QUÍMICA usando una IA con un
  * system prompt de "químico experto en pinturas". Auto-detecta el proveedor por la
- * API key presente en el entorno (igual que CI4):
- *   - Gemini (Google)    → GEMINI_API_KEY    (+ GEMINI_MODEL,    default gemini-2.0-flash)
- *   - Claude (Anthropic) → ANTHROPIC_API_KEY (+ ANTHROPIC_MODEL, default claude-sonnet-4-6)
+ * API key presente en el entorno, con este orden de PRECEDENCIA:
+ *   1. OpenRouter        → OPENROUTER_API_KEY (+ OPENROUTER_MODEL, default google/gemini-2.5-flash)
+ *   2. Gemini (Google)   → GEMINI_API_KEY     (+ GEMINI_MODEL,     default gemini-2.0-flash)
+ *   3. Claude (Anthropic)→ ANTHROPIC_API_KEY  (+ ANTHROPIC_MODEL,  default claude-sonnet-4-6)
+ * (OpenRouter es primario; Gemini/Anthropic quedan como respaldo si no hay key de OR.)
  *
  * Usa `fetch` (HTTP crudo) para replicar byte-a-byte el `curlrequest` de CI4 y su
- * comportamiento dual-provider. NO usa el SDK de Anthropic a propósito: el path activo
- * es Gemini y la restricción de esta migración es fidelidad estricta al backend CI4.
- * Si no hay ninguna key, lanza Error (el controller lo captura como 400).
+ * comportamiento multi-provider. OpenRouter usa el formato OpenAI (chat/completions);
+ * Gemini y Anthropic sus formatos nativos. Si no hay ninguna key, lanza Error
+ * (el controller lo captura como 400).
  */
 const SYSTEM_PROMPT = `Eres un químico experto en formulación de pinturas, recubrimientos y materias primas
 industriales. Recibes un listado de materias primas/insumos de un ERP, cada uno con su
@@ -57,14 +59,19 @@ Responde EXCLUSIVAMENTE con JSON válido, sin texto antes ni después, con esta 
 
 @Injectable()
 export class ClasificadorQuimicoService {
-  private readonly provider: 'gemini' | 'anthropic';
+  private readonly provider: 'openrouter' | 'gemini' | 'anthropic';
   private readonly apiKey: string;
   private readonly model: string;
 
   constructor() {
+    const openrouter = String(process.env.OPENROUTER_API_KEY ?? '');
     const gemini = String(process.env.GEMINI_API_KEY ?? '');
     const anthropic = String(process.env.ANTHROPIC_API_KEY ?? '');
-    if (gemini !== '') {
+    if (openrouter !== '') {
+      this.provider = 'openrouter';
+      this.apiKey = openrouter;
+      this.model = String(process.env.OPENROUTER_MODEL || 'google/gemini-2.5-flash');
+    } else if (gemini !== '') {
       this.provider = 'gemini';
       this.apiKey = gemini;
       this.model = String(process.env.GEMINI_MODEL || 'gemini-2.0-flash');
@@ -74,7 +81,7 @@ export class ClasificadorQuimicoService {
       this.model = String(process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6');
     } else {
       throw new Error(
-        'Falta GEMINI_API_KEY (o ANTHROPIC_API_KEY) en .env. Usá el modo offline: php spark sync:clasificar --offline',
+        'Falta OPENROUTER_API_KEY, GEMINI_API_KEY o ANTHROPIC_API_KEY en .env. Usá el modo offline: php spark sync:clasificar --offline',
       );
     }
   }
@@ -121,8 +128,10 @@ export class ClasificadorQuimicoService {
       `del ERP; agrupa los que sean el mismo material químico):\n\n` +
       JSON.stringify(compacto, null, 2);
 
-    const text =
-      this.provider === 'gemini' ? await this.callGemini(userMsg) : await this.callAnthropic(userMsg);
+    let text: string;
+    if (this.provider === 'openrouter') text = await this.callOpenRouter(userMsg);
+    else if (this.provider === 'gemini') text = await this.callGemini(userMsg);
+    else text = await this.callAnthropic(userMsg);
     return this.extraerJson(text);
   }
 
@@ -146,6 +155,36 @@ export class ClasificadorQuimicoService {
       const reason =
         json?.candidates?.[0]?.finishReason ?? json?.error?.message ?? 'sin contenido';
       throw new Error(`Gemini no devolvió texto (${reason}).`);
+    }
+    return text;
+  }
+
+  /**
+   * OpenRouter usa el formato OpenAI (chat/completions). El system prompt va como
+   * primer mensaje con role 'system'. response_format json_object es best-effort
+   * (los modelos Gemini vía OR lo respetan; extraerJson cubre el resto).
+   */
+  private async callOpenRouter(userMsg: string): Promise<string> {
+    const body = {
+      model: this.model,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: userMsg },
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.2,
+      max_tokens: 16000,
+    };
+    const json = await this.post('https://openrouter.ai/api/v1/chat/completions', body, {
+      Authorization: `Bearer ${this.apiKey}`,
+      // Opcionales de OpenRouter (rankings/atribución); no afectan el resultado.
+      'X-Title': 'PINCA-ERP',
+    });
+    const text = String(json?.choices?.[0]?.message?.content ?? '');
+    if (text === '') {
+      const reason =
+        json?.choices?.[0]?.finish_reason ?? json?.error?.message ?? 'sin contenido';
+      throw new Error(`OpenRouter no devolvió texto (${reason}).`);
     }
     return text;
   }

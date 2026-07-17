@@ -19,14 +19,8 @@ export class PagosClienteController {
   constructor(private readonly pagos: PagosClienteService) {}
 
   @Get()
-  index(
-    @Query('cliente_id') clienteId?: string,
-    @Query('factura_id') facturaId?: string,
-  ) {
-    return this.pagos.index(
-      clienteId ? Number(clienteId) : undefined,
-      facturaId ? Number(facturaId) : undefined,
-    );
+  index(@Query() query: Record<string, string>) {
+    return this.pagos.index(query);
   }
 
   @Get(':id')

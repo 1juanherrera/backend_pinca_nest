@@ -39,12 +39,96 @@ export class PagosClienteService {
     );
   }
 
-  index(clienteId?: number, facturaId?: number): Promise<Record<string, unknown>[]> {
-    const w: string[] = [];
-    const p: unknown[] = [];
-    if (clienteId) { w.push('p.clientes_id = ?'); p.push(clienteId); }
-    if (facturaId) { w.push('p.facturas_id = ?'); p.push(facturaId); }
-    return this.baseSelect(w.length ? 'WHERE ' + w.join(' AND ') : '', p);
+  /**
+   * GET /pagos_cliente
+   * Retrocompatible: sin `page` → array crudo (comportamiento histórico; usado por
+   * los drawers scoped por cliente/factura). Con `page` → { data, meta, stats }.
+   *   Scope: cliente_id, factura_id. Filtros: tipo, metodo_pago, q, desde/hasta.
+   *   stats = KPIs (count, Σ monto, counts por tipo) sobre el SCOPE (no los filtros),
+   *   igual que las FlowCards de PagosPage.
+   */
+  async index(
+    query: Record<string, string> = {},
+  ): Promise<
+    | Record<string, unknown>[]
+    | {
+        data: Record<string, unknown>[];
+        meta: { total: number; page: number; limit: number; pages: number };
+        stats: Record<string, number>;
+      }
+  > {
+    // Scope (define el universo de KPIs).
+    const scope: string[] = [];
+    const scopeParams: unknown[] = [];
+    if (query.cliente_id) { scope.push('p.clientes_id = ?'); scopeParams.push(query.cliente_id); }
+    if (query.factura_id) { scope.push('p.facturas_id = ?'); scopeParams.push(query.factura_id); }
+
+    // Filtros de UI (acotan la tabla, no los KPIs).
+    const where = [...scope];
+    const params = [...scopeParams];
+    if (query.tipo) { where.push('p.tipo = ?'); params.push(query.tipo); }
+    if (query.metodo_pago) { where.push('p.metodo_pago = ?'); params.push(query.metodo_pago); }
+    if (query.q) {
+      where.push('(p.numero_referencia LIKE ? OR c.nombre_empresa LIKE ? OR c.nombre_encargado LIKE ?)');
+      const t = `%${query.q}%`;
+      params.push(t, t, t);
+    }
+    if (query.desde) { where.push('DATE(p.fecha_pago) >= ?'); params.push(query.desde); }
+    if (query.hasta) { where.push('DATE(p.fecha_pago) <= ?'); params.push(query.hasta); }
+
+    const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+
+    // Modo legacy.
+    if (!query.page) {
+      return this.baseSelect(whereSql, params);
+    }
+
+    // Modo paginado.
+    const page = Math.max(1, parseInt(query.page, 10) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(query.limit, 10) || 20));
+    const offset = (page - 1) * limit;
+
+    const joinFrom = `FROM pagos_cliente p
+         LEFT JOIN clientes c ON c.id_clientes = p.clientes_id
+         LEFT JOIN facturas f ON f.id_facturas = p.facturas_id`;
+
+    const [countRow] = (await this.dataSource.query(
+      `SELECT COUNT(*) AS total ${joinFrom} ${whereSql}`,
+      params,
+    )) as Array<{ total: number }>;
+    const total = Number(countRow?.total ?? 0);
+
+    const data: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT p.*, c.nombre_empresa, c.nombre_encargado, f.numero AS numero_factura
+         ${joinFrom} ${whereSql}
+        ORDER BY p.fecha_pago DESC
+        LIMIT ? OFFSET ?`,
+      [...params, limit, offset],
+    );
+
+    // KPIs sobre el SCOPE (cliente/factura), independientes de los filtros de UI.
+    const scopeSql = scope.length ? 'WHERE ' + scope.join(' AND ') : '';
+    const [st] = (await this.dataSource.query(
+      `SELECT COUNT(*) AS total,
+              COALESCE(SUM(p.monto), 0) AS monto_total,
+              SUM(p.tipo = 'abono')      AS abonos,
+              SUM(p.tipo = 'anticipo')   AS anticipos,
+              SUM(p.tipo = 'pago_total') AS pagos_total
+         FROM pagos_cliente p ${scopeSql}`,
+      scopeParams,
+    )) as Array<Record<string, unknown>>;
+
+    return {
+      data,
+      meta: { total, page, limit, pages: Math.ceil(total / limit) || 1 },
+      stats: {
+        total: Number(st?.total ?? 0),
+        monto_total: Number(st?.monto_total ?? 0),
+        abonos: Number(st?.abonos ?? 0),
+        anticipos: Number(st?.anticipos ?? 0),
+        pagos_total: Number(st?.pagos_total ?? 0),
+      },
+    };
   }
 
   async show(id: number): Promise<Record<string, unknown>> {

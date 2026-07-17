@@ -25,8 +25,44 @@ export class ProveedoresService {
     private readonly repo: Repository<Proveedor>,
   ) {}
 
-  findAll(): Promise<Proveedor[]> {
-    return this.repo.find({ order: { id_proveedor: 'ASC' } });
+  /**
+   * GET /proveedores
+   * Retrocompatible: sin `page` → array crudo (order id ASC). Con `page` →
+   * { data, meta }. Filtro `q` (empresa|encargado|documento|email). QueryBuilder
+   * respeta el soft-delete. La tabla `proveedor` no tiene columna estado.
+   */
+  async findAll(
+    query: Record<string, string> = {},
+  ): Promise<
+    | Proveedor[]
+    | {
+        data: Proveedor[];
+        meta: { total: number; page: number; limit: number; pages: number };
+      }
+  > {
+    const qb = this.repo.createQueryBuilder('p').orderBy('p.id_proveedor', 'ASC');
+    if (query.q) {
+      qb.andWhere(
+        '(p.nombre_empresa LIKE :q OR p.nombre_encargado LIKE :q OR p.numero_documento LIKE :q OR p.email LIKE :q)',
+        { q: `%${query.q}%` },
+      );
+    }
+
+    if (!query.page) {
+      return qb.getMany();
+    }
+
+    const page = Math.max(1, parseInt(query.page, 10) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(query.limit, 10) || 20));
+    const [data, total] = await qb
+      .skip((page - 1) * limit)
+      .take(limit)
+      .getManyAndCount();
+
+    return {
+      data,
+      meta: { total, page, limit, pages: Math.ceil(total / limit) || 1 },
+    };
   }
 
   /** Busca activo (deleted_at IS NULL). 404 si no existe. */

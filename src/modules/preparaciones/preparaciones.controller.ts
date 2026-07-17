@@ -45,13 +45,19 @@ export class PreparacionesController {
   }
 
   @Get()
-  async index(@Query('page') page?: string, @Query('limit') limit?: string) {
-    const p = page ? Number(page) : 1;
+  async index(@Query() query: Record<string, string>) {
+    const p = query.page ? Number(query.page) : 1;
     const l = Math.min(
-      limit ? Number(limit) : PreparacionesController.LIMIT_DEFAULT,
+      query.limit ? Number(query.limit) : PreparacionesController.LIMIT_DEFAULT,
       PreparacionesController.LIMIT_MAX,
     );
-    const data = await this.preparaciones.getAll(p, l);
+    const data = await this.preparaciones.getAll(p, l, {
+      estado: query.estado,
+      item: query.item,
+      search: query.search,
+      desde: query.desde,
+      hasta: query.hasta,
+    });
     return { success: true, data };
   }
 

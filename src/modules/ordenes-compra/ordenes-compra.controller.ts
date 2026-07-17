@@ -9,6 +9,7 @@ import {
   Patch,
   Post,
   Put,
+  Query,
 } from '@nestjs/common';
 
 import { OrdenesCompraService } from './ordenes-compra.service';
@@ -30,8 +31,8 @@ export class OrdenesCompraController {
   constructor(private readonly oc: OrdenesCompraService) {}
 
   @Get()
-  index() {
-    return this.oc.listar();
+  index(@Query() query: Record<string, string>) {
+    return this.oc.listar(query);
   }
 
   @Get(':id/detalle')

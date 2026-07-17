@@ -190,21 +190,26 @@ export class SincronizacionService {
   }
 
   // ── GET /sincronizacion/maestro ──
+  /**
+   * GET /sincronizacion/maestro (MP+insumos con cobertura de proveedores).
+   * Retrocompatible: sin `page` → array crudo. Con `page` → { data, meta }.
+   * A cada fila (de la página) se le adjunta el subarray `proveedores[]` vía un
+   * único query `IN(ids)`. Filtros: tipo, search, cobertura(sin/uno/dos_mas).
+   */
   async maestro(
     search?: string,
     cobertura?: string,
     tipo?: number,
-  ): Promise<Record<string, unknown>[]> {
-    let sql = `
-      SELECT ig.id_item_general, ig.codigo, ig.nombre, ig.tipo, ig.categoria_id,
-             cat.nombre AS categoria_nombre,
-             COALESCE(ci.costo_unitario, 0) AS costo_unitario,
-             COALESCE(stock.stock_total, 0) AS stock_total,
-             COALESCE(prov.proveedores_count, 0) AS proveedores_count,
-             prov.precio_min_kg, prov.precio_max_kg,
-             CASE WHEN prov.precio_min_kg > 0 AND prov.precio_max_kg > 0
-                  THEN ROUND(((prov.precio_max_kg - prov.precio_min_kg) / prov.precio_min_kg) * 100, 1)
-                  ELSE 0 END AS spread_pct
+    page?: number,
+    limitInput?: number,
+  ): Promise<
+    | Record<string, unknown>[]
+    | {
+        data: Record<string, unknown>[];
+        meta: { total: number; page: number; limit: number; pages: number };
+      }
+  > {
+    const baseFrom = `
         FROM item_general ig
         LEFT JOIN categoria cat ON cat.id_categoria = ig.categoria_id
         LEFT JOIN costos_item ci ON ci.item_general_id = ig.id_item_general
@@ -216,25 +221,59 @@ export class SincronizacionService {
                           MAX(precio_unitario / NULLIF(factor_conversion, 0)) AS precio_max_kg
                      FROM item_proveedor
                     WHERE disponible = 1 AND item_general_id IS NOT NULL AND factor_conversion > 0
-                    GROUP BY item_general_id) prov ON prov.item_general_id = ig.id_item_general
-       WHERE ig.tipo IN (1, 2)`;
+                    GROUP BY item_general_id) prov ON prov.item_general_id = ig.id_item_general`;
+    const where: string[] = ['ig.tipo IN (1, 2)'];
     const params: unknown[] = [];
     if (tipo !== undefined) {
-      sql += ' AND ig.tipo = ?';
+      where.push('ig.tipo = ?');
       params.push(tipo);
     }
     if (search) {
-      sql += ' AND (UPPER(ig.nombre) LIKE ? OR UPPER(ig.codigo) LIKE ?)';
+      where.push('(UPPER(ig.nombre) LIKE ? OR UPPER(ig.codigo) LIKE ?)');
       const t = '%' + search.toUpperCase() + '%';
       params.push(t, t);
     }
-    if (cobertura === 'sin') sql += ' AND COALESCE(prov.proveedores_count, 0) = 0';
-    else if (cobertura === 'uno') sql += ' AND COALESCE(prov.proveedores_count, 0) = 1';
-    else if (cobertura === 'dos_mas') sql += ' AND COALESCE(prov.proveedores_count, 0) >= 2';
-    sql += ' ORDER BY ig.nombre ASC';
+    if (cobertura === 'sin') where.push('COALESCE(prov.proveedores_count, 0) = 0');
+    else if (cobertura === 'uno') where.push('COALESCE(prov.proveedores_count, 0) = 1');
+    else if (cobertura === 'dos_mas') where.push('COALESCE(prov.proveedores_count, 0) >= 2');
+    const whereSql = 'WHERE ' + where.join(' AND ');
 
-    const items: Record<string, unknown>[] = await this.dataSource.query(sql, params);
-    if (!items.length) return [];
+    const selectCols = `
+      SELECT ig.id_item_general, ig.codigo, ig.nombre, ig.tipo, ig.categoria_id,
+             cat.nombre AS categoria_nombre,
+             COALESCE(ci.costo_unitario, 0) AS costo_unitario,
+             COALESCE(stock.stock_total, 0) AS stock_total,
+             COALESCE(prov.proveedores_count, 0) AS proveedores_count,
+             prov.precio_min_kg, prov.precio_max_kg,
+             CASE WHEN prov.precio_min_kg > 0 AND prov.precio_max_kg > 0
+                  THEN ROUND(((prov.precio_max_kg - prov.precio_min_kg) / prov.precio_min_kg) * 100, 1)
+                  ELSE 0 END AS spread_pct`;
+
+    let items: Record<string, unknown>[];
+    let meta: { total: number; page: number; limit: number; pages: number } | null = null;
+
+    if (!page) {
+      items = await this.dataSource.query(
+        `${selectCols} ${baseFrom} ${whereSql} ORDER BY ig.nombre ASC`,
+        params,
+      );
+    } else {
+      const p = page > 0 ? page : 1;
+      const limit = Math.min(200, Math.max(1, limitInput || 20));
+      const offset = (p - 1) * limit;
+      const [countRow] = (await this.dataSource.query(
+        `SELECT COUNT(*) AS total ${baseFrom} ${whereSql}`,
+        params,
+      )) as Array<{ total: number }>;
+      const total = Number(countRow?.total ?? 0);
+      items = await this.dataSource.query(
+        `${selectCols} ${baseFrom} ${whereSql} ORDER BY ig.nombre ASC LIMIT ? OFFSET ?`,
+        [...params, limit, offset],
+      );
+      meta = { total, page: p, limit, pages: Math.ceil(total / limit) || 1 };
+    }
+
+    if (!items.length) return meta ? { data: [], meta } : [];
 
     const ids = items.map((i) => Number(i.id_item_general));
     const provs: Record<string, unknown>[] = await this.dataSource.query(
@@ -263,7 +302,7 @@ export class SincronizacionService {
         precio_kg: p.precio_kg != null ? Number(p.precio_kg) : null,
       });
     }
-    return items.map((i) => ({
+    const data = items.map((i) => ({
       id_item_general: Number(i.id_item_general),
       codigo: i.codigo,
       nombre: i.nombre,
@@ -278,6 +317,7 @@ export class SincronizacionService {
       spread_pct: Number(i.spread_pct),
       proveedores: byItem.get(Number(i.id_item_general)) ?? [],
     }));
+    return meta ? { data, meta } : data;
   }
 
   // ── GET /sincronizacion/duplicados ──
@@ -313,10 +353,33 @@ export class SincronizacionService {
     return pares.map((p) => ({ score: p.score, a: map.get(p.a), b: map.get(p.b) }));
   }
 
-  // ── GET /sincronizacion/huerfanos ──
-  huerfanos(): Promise<Record<string, unknown>[]> {
-    return this.dataSource.query(
-      `SELECT ig.id_item_general, ig.codigo, ig.nombre, ig.categoria_id,
+  /**
+   * GET /sincronizacion/huerfanos (MP sin proveedor disponible).
+   * Retrocompatible: sin `page` → array crudo. Con `page` → { data, meta }.
+   * Filtro `q` (nombre|codigo). El contador de la UI = meta.total.
+   */
+  async huerfanos(
+    query: Record<string, string> = {},
+  ): Promise<
+    | Record<string, unknown>[]
+    | {
+        data: Record<string, unknown>[];
+        meta: { total: number; page: number; limit: number; pages: number };
+      }
+  > {
+    const where: string[] = [
+      'ig.tipo = 1',
+      `NOT EXISTS (SELECT 1 FROM item_proveedor ip2
+                    WHERE ip2.item_general_id = ig.id_item_general AND ip2.disponible = 1)`,
+    ];
+    const params: unknown[] = [];
+    if (query.q) {
+      where.push('(ig.nombre LIKE ? OR ig.codigo LIKE ?)');
+      params.push(`%${query.q}%`, `%${query.q}%`);
+    }
+    const whereSql = 'WHERE ' + where.join(' AND ');
+
+    const select = `SELECT ig.id_item_general, ig.codigo, ig.nombre, ig.categoria_id,
               cat.nombre AS categoria_nombre,
               COALESCE(stock.stock_total, 0) AS stock_total, ultima.ultima_compra
          FROM item_general ig
@@ -330,11 +393,31 @@ export class SincronizacionService {
                       JOIN item_proveedor ip ON ip.id_item_proveedor = ocd.item_proveedor_id
                      WHERE ip.item_general_id IS NOT NULL
                      GROUP BY ip.item_general_id) ultima ON ultima.item_general_id = ig.id_item_general
-        WHERE ig.tipo = 1
-          AND NOT EXISTS (SELECT 1 FROM item_proveedor ip2
-                           WHERE ip2.item_general_id = ig.id_item_general AND ip2.disponible = 1)
-        ORDER BY ig.nombre ASC`,
+        ${whereSql}`;
+
+    if (!query.page) {
+      return this.dataSource.query(`${select} ORDER BY ig.nombre ASC`, params);
+    }
+
+    const page = Math.max(1, parseInt(query.page, 10) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(query.limit, 10) || 20));
+    const offset = (page - 1) * limit;
+
+    const [countRow] = (await this.dataSource.query(
+      `SELECT COUNT(*) AS total FROM item_general ig ${whereSql}`,
+      params,
+    )) as Array<{ total: number }>;
+    const total = Number(countRow?.total ?? 0);
+
+    const data: Record<string, unknown>[] = await this.dataSource.query(
+      `${select} ORDER BY ig.nombre ASC LIMIT ? OFFSET ?`,
+      [...params, limit, offset],
     );
+
+    return {
+      data,
+      meta: { total, page, limit, pages: Math.ceil(total / limit) || 1 },
+    };
   }
 
   // ── POST /sincronizacion/merge (endpoint HTTP: sin combinar_stock) ──

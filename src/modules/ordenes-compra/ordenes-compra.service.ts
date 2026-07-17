@@ -53,17 +53,94 @@ export class OrdenesCompraService {
     return row;
   }
 
-  /** GET /ordenes_compra → array crudo + enrichWithIva. */
-  async listar(): Promise<Record<string, unknown>[]> {
-    const rows: Record<string, unknown>[] = await this.dataSource.query(
-      `SELECT oc.*, p.nombre_empresa, p.nombre_encargado, b.nombre AS bodega_nombre
-         FROM ordenes_compra oc
+  /**
+   * GET /ordenes_compra
+   * Retrocompatible: sin `page` → array crudo + enrichWithIva (comportamiento
+   * histórico). Con `page` → { data, meta, stats } paginado server-side, mismo
+   * patrón que facturas/cotizaciones/remisiones.
+   *   Filtros: estado, q (numero | proveedor).
+   *   stats = KPIs globales (total/enviadas/recibidas/canceladas) sobre todo el
+   *   universo no borrado, independientes de los filtros (igual que los FlowCards).
+   */
+  async listar(
+    query: Record<string, string> = {},
+  ): Promise<
+    | Record<string, unknown>[]
+    | {
+        data: Record<string, unknown>[];
+        meta: { total: number; page: number; limit: number; pages: number };
+        stats: Record<string, number>;
+      }
+  > {
+    const where: string[] = ['oc.deleted_at IS NULL'];
+    const params: unknown[] = [];
+
+    if (query.estado) {
+      where.push('oc.estado = ?');
+      params.push(query.estado);
+    }
+    if (query.q) {
+      where.push('(oc.numero LIKE ? OR p.nombre_empresa LIKE ?)');
+      params.push(`%${query.q}%`, `%${query.q}%`);
+    }
+    const whereSql = where.join(' AND ');
+
+    const base = `FROM ordenes_compra oc
          LEFT JOIN proveedor p ON p.id_proveedor = oc.proveedor_id
          LEFT JOIN bodegas   b ON b.id_bodegas   = oc.bodegas_id
-        WHERE oc.deleted_at IS NULL
+        WHERE ${whereSql}`;
+
+    // Modo legacy: sin paginación devuelve el array completo (enriquecido).
+    if (!query.page) {
+      const rows: Record<string, unknown>[] = await this.dataSource.query(
+        `SELECT oc.*, p.nombre_empresa, p.nombre_encargado, b.nombre AS bodega_nombre
+         ${base}
         ORDER BY oc.id_orden DESC`,
+        params,
+      );
+      return rows.map((r) => this.enrichWithIva(r));
+    }
+
+    // Modo paginado.
+    const page = Math.max(1, parseInt(query.page, 10) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(query.limit, 10) || 20));
+    const offset = (page - 1) * limit;
+
+    const [countRow] = (await this.dataSource.query(
+      `SELECT COUNT(*) AS total ${base}`,
+      params,
+    )) as Array<{ total: number }>;
+    const total = Number(countRow?.total ?? 0);
+
+    const rows: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT oc.*, p.nombre_empresa, p.nombre_encargado, b.nombre AS bodega_nombre
+       ${base}
+      ORDER BY oc.id_orden DESC
+      LIMIT ? OFFSET ?`,
+      [...params, limit, offset],
     );
-    return rows.map((r) => this.enrichWithIva(r));
+
+    // KPIs globales (todo el universo no borrado), independientes de filtros.
+    const [statsRow] = (await this.dataSource.query(
+      `SELECT
+          COUNT(*) AS total,
+          SUM(estado = 'Enviada')   AS enviadas,
+          SUM(estado = 'Recibida')  AS recibidas,
+          SUM(estado = 'Cancelada') AS canceladas
+         FROM ordenes_compra
+        WHERE deleted_at IS NULL`,
+    )) as Array<Record<string, unknown>>;
+
+    return {
+      data: rows.map((r) => this.enrichWithIva(r)),
+      meta: { total, page, limit, pages: Math.ceil(total / limit) || 1 },
+      stats: {
+        total: Number(statsRow?.total ?? 0),
+        enviadas: Number(statsRow?.enviadas ?? 0),
+        recibidas: Number(statsRow?.recibidas ?? 0),
+        canceladas: Number(statsRow?.canceladas ?? 0),
+      },
+    };
   }
 
   /** GET /ordenes_compra/:id/detalle → objeto con lineas[] + enrichWithIva. */

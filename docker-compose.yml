@@ -52,6 +52,9 @@ services:
       DB_NAME: ${DB_NAME:-gestorpincadb}
       CORS_ALLOWED_ORIGIN: ${CORS_ALLOWED_ORIGIN:-http://localhost:5173}
       TOKEN_SECRET: ${TOKEN_SECRET}
+      # IA: OpenRouter primario (formato OpenAI); Gemini queda como respaldo.
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-2.5-flash}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
       # Nest sirve el SPA desde acá (Opción A). El dist se monta abajo.

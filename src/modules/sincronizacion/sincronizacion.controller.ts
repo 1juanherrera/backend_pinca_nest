@@ -44,11 +44,15 @@ export class SincronizacionController {
     @Query('search') search?: string,
     @Query('cobertura') cobertura?: string,
     @Query('tipo') tipo?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
   ) {
     return this.sinc.maestro(
       search,
       cobertura,
       tipo !== undefined && tipo !== '' ? Number(tipo) : undefined,
+      page !== undefined && page !== '' ? Number(page) : undefined,
+      limit !== undefined && limit !== '' ? Number(limit) : undefined,
     );
   }
 
@@ -58,8 +62,8 @@ export class SincronizacionController {
   }
 
   @Get('huerfanos')
-  huerfanos() {
-    return this.sinc.huerfanos();
+  huerfanos(@Query() query: Record<string, string>) {
+    return this.sinc.huerfanos(query);
   }
 
   @Post('merge')

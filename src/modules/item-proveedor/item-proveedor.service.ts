@@ -36,20 +36,8 @@ export class ItemProveedorService {
   }
 
   // ── GET /item_proveedores (JOIN con proveedor/item_general/unidad) ──
-  async getItemProveedores(): Promise<Record<string, unknown>[]> {
-    const items: Record<string, unknown>[] = await this.dataSource.query(
-      `SELECT ip.*, p.nombre_encargado, p.nombre_empresa, p.telefono, p.email,
-              ig.nombre AS item_general_nombre, ig.codigo AS item_general_codigo,
-              uc.nombre AS unidad_compra_nombre, ua.nombre AS unidad_almacenaje_nombre
-         FROM item_proveedor ip
-         LEFT JOIN proveedor    p  ON p.id_proveedor     = ip.proveedor_id
-         LEFT JOIN item_general ig ON ig.id_item_general = ip.item_general_id
-         LEFT JOIN unidad       uc ON uc.id_unidad       = ip.unidad_compra_id
-         LEFT JOIN unidad       ua ON ua.id_unidad       = ig.unidad_almacenaje_id
-        WHERE ip.deleted_at IS NULL`,
-    );
-    if (!items.length) throw this.fail('No se encontraron ítems de proveedores.', 404);
-    return items.map((it) => ({
+  private mapItemProveedor(it: Record<string, unknown>): Record<string, unknown> {
+    return {
       id_item_proveedor: it.id_item_proveedor,
       nombre: it.nombre,
       codigo: it.codigo,
@@ -70,7 +58,75 @@ export class ItemProveedorService {
       unidad_compra_nombre: it.unidad_compra_nombre,
       factor_conversion: Number(it.factor_conversion ?? 1),
       unidad_almacenaje_nombre: it.unidad_almacenaje_nombre,
-    }));
+    };
+  }
+
+  /**
+   * GET /item_proveedores
+   * Retrocompatible: sin `page` → array crudo mapeado (comportamiento histórico,
+   * pero SIN el 404-on-empty que rompía con catálogo vacío / páginas vacías).
+   * Con `page` → { data, meta }. Filtros: q (nombre|codigo|proveedor), disponible.
+   */
+  async getItemProveedores(
+    query: Record<string, string> = {},
+  ): Promise<
+    | Record<string, unknown>[]
+    | {
+        data: Record<string, unknown>[];
+        meta: { total: number; page: number; limit: number; pages: number };
+      }
+  > {
+    const where: string[] = ['ip.deleted_at IS NULL'];
+    const params: unknown[] = [];
+    if (query.disponible) {
+      where.push('ip.disponible = ?');
+      params.push(query.disponible);
+    }
+    if (query.q) {
+      where.push('(ip.nombre LIKE ? OR ip.codigo LIKE ? OR p.nombre_empresa LIKE ?)');
+      params.push(`%${query.q}%`, `%${query.q}%`, `%${query.q}%`);
+    }
+    const whereSql = 'WHERE ' + where.join(' AND ');
+    const base = `FROM item_proveedor ip
+         LEFT JOIN proveedor    p  ON p.id_proveedor     = ip.proveedor_id
+         LEFT JOIN item_general ig ON ig.id_item_general = ip.item_general_id
+         LEFT JOIN unidad       uc ON uc.id_unidad       = ip.unidad_compra_id
+         LEFT JOIN unidad       ua ON ua.id_unidad       = ig.unidad_almacenaje_id
+        ${whereSql}`;
+    const select = `SELECT ip.*, p.nombre_encargado, p.nombre_empresa, p.telefono, p.email,
+              ig.nombre AS item_general_nombre, ig.codigo AS item_general_codigo,
+              uc.nombre AS unidad_compra_nombre, ua.nombre AS unidad_almacenaje_nombre
+         ${base}`;
+
+    // Modo legacy: array completo (sin 404).
+    if (!query.page) {
+      const items: Record<string, unknown>[] = await this.dataSource.query(
+        `${select} ORDER BY ip.id_item_proveedor DESC`,
+        params,
+      );
+      return items.map((it) => this.mapItemProveedor(it));
+    }
+
+    // Modo paginado.
+    const page = Math.max(1, parseInt(query.page, 10) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(query.limit, 10) || 20));
+    const offset = (page - 1) * limit;
+
+    const [countRow] = (await this.dataSource.query(
+      `SELECT COUNT(*) AS total ${base}`,
+      params,
+    )) as Array<{ total: number }>;
+    const total = Number(countRow?.total ?? 0);
+
+    const items: Record<string, unknown>[] = await this.dataSource.query(
+      `${select} ORDER BY ip.id_item_proveedor DESC LIMIT ? OFFSET ?`,
+      [...params, limit, offset],
+    );
+
+    return {
+      data: items.map((it) => this.mapItemProveedor(it)),
+      meta: { total, page, limit, pages: Math.ceil(total / limit) || 1 },
+    };
   }
 
   private async getRaw(m: EntityManager | DataSource, id: number): Promise<Record<string, unknown> | null> {
