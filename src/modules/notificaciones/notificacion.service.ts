@@ -183,6 +183,34 @@ export class NotificacionService {
         dedup_key: `factura-mora-${f.id_facturas}-${day}`,
       });
     }
+
+    // 4. Facturas PRÓXIMAS a vencer (aviso preventivo N días antes del vencimiento;
+    //    N = dias_alerta_vencimiento de Configuración → antes este config no lo usaba nadie).
+    const alertaDias = N(await this.cfg.obtener('dias_alerta_vencimiento', 3));
+    const porVencer: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT f.id_facturas, f.numero, f.saldo_pendiente, c.nombre_empresa AS cliente_nombre,
+              DATEDIFF(f.fecha_vencimiento, CURDATE()) AS dias_para_vencer
+         FROM facturas f
+         LEFT JOIN clientes c ON c.id_clientes = f.cliente_id
+        WHERE f.estado IN ('Pendiente','Parcial') AND f.deleted_at IS NULL
+          AND f.saldo_pendiente > 0
+          AND f.fecha_vencimiento >= CURDATE()
+          AND f.fecha_vencimiento <= DATE_ADD(CURDATE(), INTERVAL ${alertaDias} DAY)
+        ORDER BY f.fecha_vencimiento ASC LIMIT 20`,
+    );
+    for (const f of porVencer) {
+      const monto = nfDot(f.saldo_pendiente);
+      const dias = N(f.dias_para_vencer);
+      await this.crear({
+        tipo: TIPO.FACTURA_VENCIMIENTO,
+        titulo: `Factura ${f.numero} próxima a vencer`,
+        mensaje: `${f.cliente_nombre ? `${f.cliente_nombre} · ` : ''}${dias <= 0 ? 'vence hoy' : `vence en ${dias} día${dias === 1 ? '' : 's'}`} · saldo $${monto}`,
+        rol_target: 'admin',
+        link: '/cartera',
+        metadata: { id_facturas: N(f.id_facturas), dias_para_vencer: dias, saldo: N(f.saldo_pendiente) },
+        dedup_key: `factura-porvencer-${f.id_facturas}-${day}`,
+      });
+    }
   }
 
   async crear(data: CrearNotif, m?: EntityManager): Promise<number | false> {
