@@ -56,7 +56,12 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       select: { token_version: true },
     });
 
-    if (row && Number(row.token_version) !== tokenVersion) {
+    // Usuario borrado/inexistente: el token NO debe seguir autenticando con el rol
+    // cacheado hasta que expire (antes, si `row` era null, el chequeo se saltaba).
+    if (!row) {
+      throw new UnauthorizedException('Usuario no válido. Iniciá sesión de nuevo.');
+    }
+    if (Number(row.token_version) !== tokenVersion) {
       throw new UnauthorizedException('Sesión invalidada. Iniciá sesión de nuevo.');
     }
 
