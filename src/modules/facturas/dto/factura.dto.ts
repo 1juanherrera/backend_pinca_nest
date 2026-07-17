@@ -59,7 +59,8 @@ export class CreateFacturaDto {
   items: FacturaLineaDto[];
 }
 
-/** update: edición de cabecera (sin items). CI4 pasa el body crudo a update_table. */
+/** update: edición de cabecera + líneas (opcional). Si vienen `items`, se
+ *  reemplaza el detalle completo (DELETE + re-INSERT) dentro de la transacción. */
 export class UpdateFacturaDto {
   @IsOptional() @IsString()
   fecha_emision?: string;
@@ -84,6 +85,12 @@ export class UpdateFacturaDto {
 
   @IsOptional() @IsString()
   observaciones?: string;
+
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => FacturaLineaDto)
+  items?: FacturaLineaDto[];
 }
 
 export class CambiarEstadoFacturaDto {

@@ -75,6 +75,7 @@ export class FacturasService {
     // campo `estado` almacenado esté al día.
     const efectivo = query.efectivo === '1' || query.efectivo === 'true';
     const effCase = `CASE
+        WHEN f.estado = 'Anulada' THEN 'Anulada'
         WHEN f.estado = 'Pagada' OR f.saldo_pendiente <= 0 THEN 'Pagada'
         WHEN DATEDIFF(CURDATE(), f.fecha_vencimiento) > 0 THEN 'Vencida'
         WHEN f.saldo_pendiente < f.total THEN 'Parcial'
@@ -102,6 +103,9 @@ export class FacturasService {
       const like = `%${query.q}%`;
       params.push(like, like, like, like);
     }
+    // Vista Cartera: las ANULADAS no son cartera (al anular, saldo se resetea a total).
+    // Se excluyen de data/count para no inflar el "saldo por cobrar" ni los KPIs.
+    if (efectivo) where.push("f.estado <> 'Anulada'");
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
     const limit = Math.min(Math.max(Number(query.limit) || 20, 1), 200);
@@ -131,7 +135,7 @@ export class FacturasService {
                     COALESCE(SUM(${effCase} = 'Vencida'),0)   AS vencida,
                     COALESCE(SUM(${effCase} = 'Parcial'),0)   AS parcial,
                     COALESCE(SUM(CASE WHEN ${effCase} <> 'Pagada' THEN f.saldo_pendiente ELSE 0 END),0) AS saldo_por_cobrar
-               FROM facturas f`,
+               FROM facturas f WHERE f.estado <> 'Anulada'`,
           )
         )[0]
       : (
@@ -320,9 +324,25 @@ export class FacturasService {
       const repo = manager.getRepository(Factura);
       const patch: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(dto)) {
+        // `items` NO es columna de facturas → se maneja aparte (reemplazo de detalle).
+        if (k === 'items') continue;
         if (v !== undefined) patch[k] = v;
       }
-      await repo.update(id, patch);
+      if (Object.keys(patch).length) await repo.update(id, patch);
+
+      // Reemplazo completo del detalle si el form mandó líneas (antes se
+      // descartaban silenciosamente → cabecera nueva + detalle viejo).
+      if (Array.isArray(dto.items)) {
+        await manager.query(`DELETE FROM facturas_detalle WHERE facturas_id = ?`, [id]);
+        for (const it of dto.items) {
+          await manager.query(
+            `INSERT INTO facturas_detalle (facturas_id, descripcion, cantidad, precio_unit)
+             VALUES (?, ?, ?, ?)`,
+            [id, it.descripcion, it.cantidad, it.precio_unit],
+          );
+        }
+      }
+
       if (Object.prototype.hasOwnProperty.call(dto, 'total')) {
         await this.recalcularSaldo(id, manager);
       }

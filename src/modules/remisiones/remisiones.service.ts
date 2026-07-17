@@ -299,14 +299,18 @@ export class RemisionesService {
       const total = subtotal + iva;
 
       const numeroFac = await this.numeracion.reservar('factura', m);
+      // Plazo de vencimiento desde config (antes 30 días fijos; el camino
+      // cotización→factura ya lo leía). Coherente con Configuración → Financiero.
+      const diasVenc = await this.configNum(m, 'dias_vencimiento_factura', 30);
       const insFac: { insertId: number } = await m.query(
         `INSERT INTO facturas
            (numero, cliente_id, fecha_emision, fecha_vencimiento, subtotal, descuento,
             impuestos, retencion, total, saldo_pendiente, estado, observaciones)
-         VALUES (?, ?, CURDATE(), DATE_ADD(CURDATE(), INTERVAL 30 DAY), ?, 0, ?, 0, ?, ?, 'Pendiente', ?)`,
+         VALUES (?, ?, CURDATE(), DATE_ADD(CURDATE(), INTERVAL ? DAY), ?, 0, ?, 0, ?, ?, 'Pendiente', ?)`,
         [
           numeroFac,
           rem.cliente_id,
+          diasVenc,
           subtotal,
           iva,
           total,
