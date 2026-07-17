@@ -771,8 +771,11 @@ export class PreparacionesService {
     }
 
     await this.dataSource.transaction(async (m) => {
+      // FOR UPDATE: serializa el read-modify-write del estado. Sin esto, dos
+      // cancelaciones concurrentes leen oldEstado≠3 y ambas reintegran stock
+      // (doble reintegro de capas). Con el lock, la 2ª ve oldEstado=3 y no reintegra.
       const oldRows: { estado: number }[] = await m.query(
-        `SELECT estado FROM preparaciones WHERE id_preparaciones = ?`,
+        `SELECT estado FROM preparaciones WHERE id_preparaciones = ? FOR UPDATE`,
         [id],
       );
       if (!oldRows.length) {

@@ -326,6 +326,19 @@ export class RequisicionesService {
     }
 
     return this.dataSource.transaction(async (m) => {
+      // Anti doble-conversión concurrente (misma clase de bug ya arreglada en
+      // cotización/remisión): re-lock + re-valida DENTRO de la tx. El FOR UPDATE
+      // serializa; si otra request ya las convirtió, acá se ven CONVERTIDA.
+      const locked: { id_requisicion: number; estado: string }[] = await m.query(
+        `SELECT id_requisicion, estado FROM requisiciones_compra WHERE id_requisicion IN (${ph}) FOR UPDATE`,
+        ids,
+      );
+      for (const r of locked) {
+        if (r.estado !== 'APROBADA') {
+          throw this.fail(`La requisición #${r.id_requisicion} ya no está APROBADA (¿ya se convirtió?).`, 409);
+        }
+      }
+
       const ocCreadas: number[] = [];
       for (const [proveedorId, reqs] of grupos) {
         const numOC = await this.numeracion.reservar('orden_compra', m as EntityManager);
@@ -347,10 +360,15 @@ export class RequisicionesService {
              VALUES (?, ?, ?, ?, ?, ?)`,
             [ocId, r.item_proveedor_id, r.item_general_id, r.cantidad_solicitada, precio, subtotal],
           );
-          await m.query(
-            `UPDATE requisiciones_compra SET estado = 'CONVERTIDA', orden_compra_id = ? WHERE id_requisicion = ?`,
+          const upd: { affectedRows: number } = await m.query(
+            `UPDATE requisiciones_compra SET estado = 'CONVERTIDA', orden_compra_id = ?
+              WHERE id_requisicion = ? AND estado = 'APROBADA'`,
             [ocId, r.id_requisicion],
           );
+          if (!upd.affectedRows) {
+            // Otra transacción la convirtió entre el lock y este UPDATE → aborta todo.
+            throw this.fail(`La requisición #${r.id_requisicion} ya fue convertida.`, 409);
+          }
         }
         await m.query(`UPDATE ordenes_compra SET total = ? WHERE id_orden = ?`, [total, ocId]);
         ocCreadas.push(ocId);

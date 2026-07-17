@@ -287,14 +287,20 @@ export class AuthService {
     const row = rows[0];
     if (!row) throw this.fail('Refresh token inválido o expirado', 401);
 
+    // Rotación ATÓMICA primero: dos requests concurrentes con el MISMO refresh
+    // (reintento de red / doble pestaña) leerían ambos revoked=0; con la guarda
+    // `AND revoked=0` solo UNO gana la revocación → solo uno emite par nuevo.
+    const revoke: { affectedRows: number } = await this.dataSource.query(
+      `UPDATE refresh_tokens SET revoked = 1 WHERE id = ? AND revoked = 0`,
+      [row.id],
+    );
+    if (!revoke.affectedRows) throw this.fail('Refresh token ya fue usado', 401);
+
     const usuario = await this.findById(Number(row.usuario_id));
     if (!usuario) throw this.fail('Refresh token inválido o expirado', 401);
 
     const modulos = await this.modulosDeRol(String(usuario.rol ?? 'operador'));
     const token = await this.generarJwt(usuario, modulos);
-
-    // Rotación: revoca el viejo, emite uno nuevo.
-    await this.dataSource.query(`UPDATE refresh_tokens SET revoked = 1 WHERE id = ?`, [row.id]);
     const nuevoRefresh = await this.crearRefreshToken(Number(row.usuario_id));
 
     return { ok: true, msg: '', token, refresh_token: nuevoRefresh };

@@ -412,6 +412,19 @@ export class OrdenesCompraService {
     }
 
     await this.dataSource.transaction(async (m) => {
+      // Re-lock + re-valida la cabecera OC dentro de la tx: si otra request la
+      // canceló entre el check inicial y acá, no ingresamos stock ni pisamos su
+      // estado 'Cancelada' con 'Recibida'.
+      const cab = (await m.query(
+        `SELECT estado FROM ordenes_compra WHERE id_orden = ? AND deleted_at IS NULL FOR UPDATE`,
+        [idOrden],
+      )) as Array<{ estado: string }>;
+      if (!cab[0] || cab[0].estado !== 'Enviada') {
+        throw new BadRequestException(
+          `La orden ya no está 'Enviada' (estado: ${cab[0]?.estado ?? 'inexistente'}) — recargá la orden.`,
+        );
+      }
+
       const lockRows: {
         recibido_en: string | null;
         cantidad: string;
@@ -595,6 +608,17 @@ export class OrdenesCompraService {
     const round = (x: number, d: number) => { const f = 10 ** d; return Math.round(x * f) / f; };
 
     await this.dataSource.transaction(async (m) => {
+      // Re-lock + re-valida la cabecera OC (igual que recibirLinea).
+      const cab = (await m.query(
+        `SELECT estado FROM ordenes_compra WHERE id_orden = ? AND deleted_at IS NULL FOR UPDATE`,
+        [idOrden],
+      )) as Array<{ estado: string }>;
+      if (!cab[0] || cab[0].estado !== 'Enviada') {
+        throw new BadRequestException(
+          `La orden ya no está 'Enviada' (estado: ${cab[0]?.estado ?? 'inexistente'}) — recargá la orden.`,
+        );
+      }
+
       const loteProveedor = await this.capas.resolverLoteProveedor(m, idOrden, loteProvBody);
       for (const { idDetalle, linea, cantRec } of preparadas) {
         const lock = (await m.query(

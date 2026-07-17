@@ -136,6 +136,12 @@ export class NumeracionService {
     const saved = await this.dataSource.transaction(async (manager) => {
       const activo = body.activo ?? 1;
       if (Number(activo) === 1) {
+        // Lock de todas las series del tipo_doc: serializa activaciones
+        // concurrentes (evita que queden DOS series activo=1 → folios duplicados).
+        await manager.query(
+          `SELECT id_numeracion FROM numeracion_documentos WHERE tipo_doc = ? FOR UPDATE`,
+          [body.tipo_doc],
+        );
         await manager.query(
           `UPDATE numeracion_documentos SET activo = 0 WHERE tipo_doc = ?`,
           [body.tipo_doc],
@@ -188,6 +194,11 @@ export class NumeracionService {
 
     await this.dataSource.transaction(async (manager) => {
       if (body.activo != null && Number(body.activo) === 1) {
+        // Lock del tipo_doc (serializa activaciones concurrentes; ver create()).
+        await manager.query(
+          `SELECT id_numeracion FROM numeracion_documentos WHERE tipo_doc = ? FOR UPDATE`,
+          [serie.tipo_doc],
+        );
         await manager.query(
           `UPDATE numeracion_documentos SET activo = 0 WHERE tipo_doc = ? AND id_numeracion <> ?`,
           [serie.tipo_doc, id],
