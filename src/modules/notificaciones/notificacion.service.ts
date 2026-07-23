@@ -108,29 +108,32 @@ export class NotificacionService {
 
     // 1. Stock crítico
     const criticoDias = N(await this.cfg.obtener('stock_critico_dias', 7));
+    // Ventana (días) para medir el consumo y proyectar días de stock restante.
+    // Configurable → alinea con los umbrales de stock (antes era 30 hardcodeado).
+    const ventana = Math.max(1, N(await this.cfg.obtener('ventana_consumo_dias', 30)));
     const criticas: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT ig.id_item_general, ig.nombre,
               COALESCE(SUM(ic.cantidad_disponible), 0) AS stock,
               (SELECT SUM(pid.cantidad) FROM produccion_insumos_detalle pid
                  JOIN preparaciones p ON p.id_preparaciones = pid.preparacion_id
                 WHERE pid.item_general_id = ig.id_item_general
-                  AND p.fecha_creacion >= DATE_SUB(NOW(), INTERVAL 30 DAY) AND p.estado != 3) AS consumo_30d
+                  AND p.fecha_creacion >= DATE_SUB(NOW(), INTERVAL ${ventana} DAY) AND p.estado != 3) AS consumo_ventana
          FROM item_general ig
          LEFT JOIN inventario_capas ic ON ic.item_general_id = ig.id_item_general AND ic.estado = 1
         WHERE ig.deleted_at IS NULL AND ig.tipo = 1
         GROUP BY ig.id_item_general, ig.nombre
-       HAVING consumo_30d > 0`,
+       HAVING consumo_ventana > 0`,
     );
     for (const mp of criticas) {
       const stock = N(mp.stock);
-      const cons30 = N(mp.consumo_30d);
-      const diario = cons30 > 0 ? cons30 / 30 : 0;
+      const consVentana = N(mp.consumo_ventana);
+      const diario = consVentana > 0 ? consVentana / ventana : 0;
       const diasRest = diario > 0 ? Math.round(stock / diario) : null;
       if (diasRest !== null && diasRest < criticoDias) {
         await this.crear({
           tipo: TIPO.MP_CRITICA,
           titulo: `Stock crítico: ${mp.nombre}`,
-          mensaje: `Quedan ~${diasRest} días al ritmo actual (${cons30} kg consumidos en 30d).`,
+          mensaje: `Quedan ~${diasRest} días al ritmo actual (${consVentana} kg consumidos en ${ventana}d).`,
           rol_target: 'admin',
           link: '/inventario-global',
           metadata: { item_general_id: N(mp.id_item_general), dias_restantes: diasRest },
@@ -139,13 +142,14 @@ export class NotificacionService {
       }
     }
 
-    // 2. OCs Enviadas sin recibir hace >14 días
+    // 2. OCs Enviadas sin recibir hace > N días (umbral configurable)
+    const ocDemora = Math.max(1, N(await this.cfg.obtener('oc_demora_dias', 14)));
     const ocs: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT oc.id_orden, oc.numero, oc.fecha, p.nombre_empresa AS proveedor_nombre,
               DATEDIFF(NOW(), oc.fecha) AS dias
          FROM ordenes_compra oc
          LEFT JOIN proveedor p ON p.id_proveedor = oc.proveedor_id
-        WHERE oc.estado = 'Enviada' AND oc.deleted_at IS NULL AND oc.fecha < DATE_SUB(NOW(), INTERVAL 14 DAY)
+        WHERE oc.estado = 'Enviada' AND oc.deleted_at IS NULL AND oc.fecha < DATE_SUB(NOW(), INTERVAL ${ocDemora} DAY)
         ORDER BY oc.fecha ASC LIMIT 20`,
     );
     for (const oc of ocs) {

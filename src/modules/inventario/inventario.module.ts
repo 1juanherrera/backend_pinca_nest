@@ -4,6 +4,7 @@ import { InventarioService } from './inventario.service';
 import { CapasService } from './capas.service';
 import { InventarioController } from './inventario.controller';
 import { MovimientosController } from './movimientos.controller';
+import { ConfiguracionModule } from '../configuracion/configuracion.module';
 
 /**
  * Fase 3 — lecturas de inventario/capas/movimientos + motor de ESCRITURA de capas.
@@ -12,6 +13,7 @@ import { MovimientosController } from './movimientos.controller';
  * No usa forFeature: todo es raw SQL vía DataSource.
  */
 @Module({
+  imports: [ConfiguracionModule],
   controllers: [InventarioController, MovimientosController],
   providers: [InventarioService, CapasService],
   exports: [CapasService],

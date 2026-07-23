@@ -8,6 +8,7 @@ import { DataSource } from 'typeorm';
 import { CapasService, MOV } from './capas.service';
 import { AjusteManualDto } from './dto/ajuste-manual.dto';
 import { TraspasoDto } from './dto/traspaso.dto';
+import { ConfiguracionService } from '../configuracion/configuracion.service';
 
 /**
  * Fase 3 — LECTURAS de inventario/capas/movimientos + ajuste manual (consumo FIFO).
@@ -18,6 +19,7 @@ export class InventarioService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly capas: CapasService,
+    private readonly cfg: ConfiguracionService,
   ) {}
 
   /**
@@ -448,16 +450,18 @@ export class InventarioService {
       });
     }
 
+    // Ventana (días) para medir consumo y proyectar días de stock restante. Configurable.
+    const ventana = Math.max(1, Number(await this.cfg.obtener('ventana_consumo_dias', 30)) || 30);
     const consumoRows: Record<string, unknown>[] = await this.dataSource.query(
-      `SELECT pid.item_general_id, SUM(pid.cantidad) AS consumo_30_dias
+      `SELECT pid.item_general_id, SUM(pid.cantidad) AS consumo_ventana
          FROM produccion_insumos_detalle pid
          JOIN preparaciones p ON p.id_preparaciones = pid.preparacion_id
-        WHERE p.fecha_creacion >= DATE_SUB(NOW(), INTERVAL 30 DAY) AND p.estado != 3
+        WHERE p.fecha_creacion >= DATE_SUB(NOW(), INTERVAL ${ventana} DAY) AND p.estado != 3
         GROUP BY pid.item_general_id`,
     );
     const consumo = new Map<number, number>();
     for (const r of consumoRows) {
-      consumo.set(Number(r.item_general_id), Number(r.consumo_30_dias));
+      consumo.set(Number(r.item_general_id), Number(r.consumo_ventana));
     }
 
     return items.map((it) => {
@@ -465,7 +469,7 @@ export class InventarioService {
       const stock = Number(it.stock_total);
       const consumoTotal = consumo.has(id) ? (consumo.get(id) as number) : null;
       const consumoDiario =
-        consumoTotal ? Math.round((consumoTotal / 30) * 1e6) / 1e6 : null;
+        consumoTotal ? Math.round((consumoTotal / ventana) * 1e6) / 1e6 : null;
       const diasRestantes =
         consumoDiario && consumoDiario > 0
           ? Math.round(stock / consumoDiario)

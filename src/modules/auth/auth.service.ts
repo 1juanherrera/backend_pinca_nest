@@ -64,9 +64,11 @@ export class AuthService {
 
   private async crearRefreshToken(usuarioId: number): Promise<string> {
     const plain = crypto.randomBytes(32).toString('hex');
+    // Duración del refresh token (sesión recordada), configurable. Antes 7d fijo.
+    const dias = Math.max(1, Number(await this.cfg.obtener('refresh_token_dias', 7)) || 7);
     await this.dataSource.query(
       `INSERT INTO refresh_tokens (usuario_id, token_hash, expires_at, created_at, revoked)
-       VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 7 DAY), NOW(), 0)`,
+       VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ${dias} DAY), NOW(), 0)`,
       [usuarioId, crypto.createHash('sha256').update(plain).digest('hex')],
     );
     return plain;

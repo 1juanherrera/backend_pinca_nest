@@ -55,13 +55,14 @@ export class SaludSistemaService {
        WHERE ig.tipo = 0 AND ig.deleted_at IS NULL AND f.id_formulaciones IS NULL
        ORDER BY ig.nombre LIMIT 50`);
 
-    // 4. OCs Enviadas hace >14 días sin recibir
+    // 4. OCs Enviadas hace > N días sin recibir (umbral configurable)
+    const ocDemora = Math.max(1, N(await this.cfg.obtener('oc_demora_dias', 14)));
     const ocsRetrasadas: Record<string, unknown>[] = await this.dataSource.query(`
       SELECT oc.id_orden, oc.numero, oc.fecha, oc.fecha_esperada, oc.total, p.nombre_empresa,
              DATEDIFF(NOW(), oc.fecha) AS dias_pendiente
         FROM ordenes_compra oc
         LEFT JOIN proveedor p ON p.id_proveedor = oc.proveedor_id
-       WHERE oc.estado = 'Enviada' AND oc.deleted_at IS NULL AND oc.fecha < DATE_SUB(CURDATE(), INTERVAL 14 DAY)
+       WHERE oc.estado = 'Enviada' AND oc.deleted_at IS NULL AND oc.fecha < DATE_SUB(CURDATE(), INTERVAL ${ocDemora} DAY)
        ORDER BY oc.fecha ASC LIMIT 30`);
 
     // 5. Facturas en mora (umbral configurable)

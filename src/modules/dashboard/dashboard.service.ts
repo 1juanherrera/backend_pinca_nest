@@ -3,6 +3,7 @@ import { DataSource } from 'typeorm';
 
 import { CarteraService } from '../cartera/cartera.service';
 import { SincronizacionService } from '../sincronizacion/sincronizacion.service';
+import { ConfiguracionService } from '../configuracion/configuracion.service';
 
 const N = (x: unknown) => Number(x ?? 0);
 const round = (x: number, d: number) => {
@@ -23,6 +24,7 @@ export class DashboardService {
     private readonly dataSource: DataSource,
     private readonly cartera: CarteraService,
     private readonly sincronizacion: SincronizacionService,
+    private readonly cfg: ConfiguracionService,
   ) {}
 
   async index(): Promise<Record<string, unknown>> {
@@ -176,21 +178,23 @@ export class DashboardService {
         WHERE ig.tipo = 1
         GROUP BY ig.id_item_general, ig.nombre, ig.codigo`,
     );
+    // Ventana (días) para medir consumo y proyectar días de stock restante. Configurable.
+    const ventana = Math.max(1, N(await this.cfg.obtener('ventana_consumo_dias', 30)) || 30);
     const consumo: Record<string, unknown>[] = await this.dataSource.query(
-      `SELECT pid.item_general_id, SUM(pid.cantidad) AS consumo_30d
+      `SELECT pid.item_general_id, SUM(pid.cantidad) AS consumo_ventana
          FROM produccion_insumos_detalle pid
          JOIN preparaciones p ON p.id_preparaciones = pid.preparacion_id
-        WHERE p.fecha_creacion >= DATE_SUB(NOW(), INTERVAL 30 DAY) AND p.estado != 3
+        WHERE p.fecha_creacion >= DATE_SUB(NOW(), INTERVAL ${ventana} DAY) AND p.estado != 3
         GROUP BY pid.item_general_id`,
     );
     const consumoMap = new Map<number, number>();
-    for (const c of consumo) consumoMap.set(N(c.item_general_id), N(c.consumo_30d));
+    for (const c of consumo) consumoMap.set(N(c.item_general_id), N(c.consumo_ventana));
 
     const criticas: Record<string, unknown>[] = [];
     for (const it of items) {
       const stock = N(it.stock_total);
-      const consumo30 = consumoMap.get(N(it.id_item_general)) ?? 0;
-      const diario = consumo30 > 0 ? consumo30 / 30 : 0;
+      const consumoVentana = consumoMap.get(N(it.id_item_general)) ?? 0;
+      const diario = consumoVentana > 0 ? consumoVentana / ventana : 0;
       const dias = diario > 0 ? Math.round(stock / diario) : null;
       if (dias !== null && dias < umbralDias) {
         criticas.push({
