@@ -285,18 +285,31 @@ export class FacturasService {
         ? dto.numero
         : await this.numeracion.reservar('factura', manager);
 
+      // Integridad: el subtotal y el total se RECALCULAN en el server desde las
+      // líneas (no se confía en lo que manda el cliente; era el único documento
+      // que guardaba total/subtotal crudos). descuento/impuestos/retención sí son
+      // inputs del usuario (dependen del toggle IVA y de campos manuales).
+      const r2 = (x: number) => Math.round(x * 100) / 100;
+      const subtotal = r2(
+        dto.items.reduce((s, it) => s + Number(it.cantidad) * Number(it.precio_unit), 0),
+      );
+      const descuento = Number(dto.descuento) || 0;
+      const impuestos = Number(dto.impuestos) || 0;
+      const retencion = Number(dto.retencion) || 0;
+      const total = r2(subtotal - descuento + impuestos - retencion);
+
       const repo = manager.getRepository(Factura);
       const factura = repo.create({
         numero,
         cliente_id: dto.cliente_id,
         fecha_emision: dto.fecha_emision ?? null,
         fecha_vencimiento: dto.fecha_vencimiento ?? null,
-        subtotal: dto.subtotal != null ? String(dto.subtotal) : null,
-        descuento: String(dto.descuento ?? 0),
-        impuestos: dto.impuestos != null ? String(dto.impuestos) : null,
-        retencion: dto.retencion != null ? String(dto.retencion) : null,
-        total: String(dto.total),
-        saldo_pendiente: String(dto.total),
+        subtotal: String(subtotal),
+        descuento: String(descuento),
+        impuestos: String(impuestos),
+        retencion: String(retencion),
+        total: String(total),
+        saldo_pendiente: String(total),
         observaciones: dto.observaciones ?? null,
       });
       const saved = await repo.save(factura);
