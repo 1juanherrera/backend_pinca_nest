@@ -43,6 +43,7 @@ import { CostosModule } from './modules/costos/costos.module';
 import { CostosProduccionModule } from './modules/costos-produccion/costos-produccion.module';
 import { BodegaInventarioModule } from './modules/bodega-inventario/bodega-inventario.module';
 import { FormulacionesCostosModule } from './modules/formulaciones-costos/formulaciones-costos.module';
+import { NominaModule } from './modules/nomina/nomina.module';
 
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { VisorReadonlyGuard } from './common/guards/visor-readonly.guard';
@@ -127,6 +128,8 @@ import { HealthController } from './health.controller';
     BodegaInventarioModule,
     // Costeo — simulaciones de costo de formulaciones (costos/:id, recalcular, proveedores, opciones):
     FormulacionesCostosModule,
+    // RRHH — nómina básica (empleados + liquidación por período, admin-only):
+    NominaModule,
   ],
   controllers: [HealthController],
   providers: [
