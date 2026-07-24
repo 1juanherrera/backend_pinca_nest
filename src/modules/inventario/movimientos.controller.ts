@@ -7,6 +7,12 @@ import { InventarioService } from './inventario.service';
 export class MovimientosController {
   constructor(private readonly inventario: InventarioService) {}
 
+  /** Lista de responsables (username + nombre) para el filtro. Sin datos de rol. */
+  @Get('responsables')
+  responsables() {
+    return this.inventario.responsables();
+  }
+
   @Get()
   index(@Query() q: Record<string, string>) {
     const page = q.page ? Number(q.page) : 1;

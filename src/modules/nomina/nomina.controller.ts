@@ -15,6 +15,9 @@ import { NominaService } from './nomina.service';
 import {
   CreateEmpleadoDto,
   CreatePeriodoDto,
+  PagarPeriodoDto,
+  RegistrarAbonoDto,
+  RegistrarDescuentoDto,
   UpdateDetalleDto,
   UpdateEmpleadoDto,
 } from './dto/nomina.dto';
@@ -62,6 +65,26 @@ export class NominaController {
     return { mensaje: 'Empleado archivado.' };
   }
 
+  // ── Descuentos (mercancía sacada / acuerdos verbales) ──
+  @Get('descuentos')
+  listarDescuentosTodos() {
+    return this.nomina.listarDescuentos();
+  }
+
+  @Get('empleados/:id/descuentos')
+  listarDescuentosEmpleado(@Param('id', ParseIntPipe) id: number) {
+    return this.nomina.listarDescuentos(id);
+  }
+
+  @Post('empleados/:id/descuentos')
+  registrarDescuento(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: RegistrarDescuentoDto,
+    @CurrentUser('username') username: string,
+  ) {
+    return this.nomina.registrarDescuento(id, dto, username);
+  }
+
   // ── Períodos ──
   @Get('periodos')
   listarPeriodos() {
@@ -86,17 +109,35 @@ export class NominaController {
     return this.nomina.cerrarPeriodo(id);
   }
 
+  @Patch('periodos/:id/pagar')
+  pagarPeriodo(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: PagarPeriodoDto,
+    @CurrentUser('username') username: string,
+  ) {
+    return this.nomina.pagarPeriodo(id, dto, username);
+  }
+
   @Delete('periodos/:id')
   eliminarPeriodo(@Param('id', ParseIntPipe) id: number) {
     return this.nomina.eliminarPeriodo(id);
   }
 
-  // ── Detalle (ajuste de días) ──
+  // ── Detalle (ajuste de días + abonos parciales) ──
   @Put('detalle/:id')
   actualizarDetalle(
     @Param('id', ParseIntPipe) id: number,
     @Body() dto: UpdateDetalleDto,
   ) {
     return this.nomina.actualizarDetalle(id, dto.dias_trabajados);
+  }
+
+  @Post('detalle/:id/abonos')
+  registrarAbono(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: RegistrarAbonoDto,
+    @CurrentUser('username') username: string,
+  ) {
+    return this.nomina.registrarAbono(id, dto, username);
   }
 }

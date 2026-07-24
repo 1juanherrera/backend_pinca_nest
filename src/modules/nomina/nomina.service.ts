@@ -3,12 +3,15 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { DataSource } from 'typeorm';
+import { DataSource, EntityManager } from 'typeorm';
 
 import { ConfiguracionService } from '../configuracion/configuracion.service';
 import {
   CreateEmpleadoDto,
   CreatePeriodoDto,
+  PagarPeriodoDto,
+  RegistrarAbonoDto,
+  RegistrarDescuentoDto,
   UpdateEmpleadoDto,
 } from './dto/nomina.dto';
 
@@ -75,6 +78,56 @@ export class NominaService {
       total_deducciones: totalDeducciones,
       neto_pagar: totalDevengado - totalDeducciones,
     };
+  }
+
+  /**
+   * FIFO: consume los descuentos PENDIENTES de un empleado contra un
+   * presupuesto (el saldo disponible de un renglón). Si un descuento pendiente
+   * es más grande que lo que queda de presupuesto, se aplica parcialmente y el
+   * remanente se re-inserta como un nuevo 'pendiente' (arrastre al próximo
+   * período/renglón). Debe correr DENTRO de la transacción que lockeó el
+   * renglón destino. Devuelve el total efectivamente aplicado.
+   */
+  private async aplicarDescuentosPendientes(
+    m: EntityManager,
+    empleadoId: number,
+    detalleId: number,
+    presupuesto: number,
+    username?: string,
+  ): Promise<number> {
+    if (presupuesto <= 0) return 0;
+    const pendientes = await m.query(
+      `SELECT * FROM nomina_descuentos WHERE empleado_id = ? AND estado = 'pendiente'
+        ORDER BY fecha ASC, id ASC FOR UPDATE`,
+      [empleadoId],
+    );
+    let restante = presupuesto;
+    let totalAplicado = 0;
+    for (const desc of pendientes) {
+      if (restante <= 0) break;
+      const monto = N(desc.monto);
+      if (monto <= restante) {
+        await m.query(
+          `UPDATE nomina_descuentos SET estado = 'aplicado', aplicado_detalle_id = ? WHERE id = ?`,
+          [detalleId, desc.id],
+        );
+        restante -= monto;
+        totalAplicado += monto;
+      } else {
+        await m.query(
+          `UPDATE nomina_descuentos SET monto = ?, estado = 'aplicado', aplicado_detalle_id = ? WHERE id = ?`,
+          [r0(restante), detalleId, desc.id],
+        );
+        await m.query(
+          `INSERT INTO nomina_descuentos (empleado_id, concepto, monto, fecha, estado, created_by)
+           VALUES (?, ?, ?, ?, 'pendiente', ?)`,
+          [empleadoId, desc.concepto, r0(monto - restante), desc.fecha, username ?? null],
+        );
+        totalAplicado += restante;
+        restante = 0;
+      }
+    }
+    return r0(totalAplicado);
   }
 
   // ── EMPLEADOS ───────────────────────────────────────────────────────────
@@ -190,7 +243,8 @@ export class NominaService {
   async listarPeriodos() {
     return this.dataSource.query(
       `SELECT p.*,
-              (SELECT COUNT(*) FROM nomina_detalle d WHERE d.periodo_id = p.id) AS empleados
+              (SELECT COUNT(*) FROM nomina_detalle d WHERE d.periodo_id = p.id) AS empleados,
+              (SELECT COALESCE(SUM(saldo),0) FROM nomina_detalle d WHERE d.periodo_id = p.id) AS total_saldo
          FROM nomina_periodos p
         ORDER BY p.id DESC`,
     );
@@ -206,7 +260,35 @@ export class NominaService {
       `SELECT * FROM nomina_detalle WHERE periodo_id = ? ORDER BY empleado_nombre ASC`,
       [id],
     );
-    return { ...rows[0], detalle };
+
+    const detalleIds: number[] = detalle.map((d: { id: number }) => N(d.id));
+    const abonosPorDetalle = new Map<number, unknown[]>();
+    if (detalleIds.length) {
+      const abonos = await this.dataSource.query(
+        `SELECT * FROM nomina_abonos WHERE detalle_id IN (${detalleIds.map(() => '?').join(',')})
+          ORDER BY fecha ASC, id ASC`,
+        detalleIds,
+      );
+      for (const a of abonos) {
+        const key = N(a.detalle_id);
+        if (!abonosPorDetalle.has(key)) abonosPorDetalle.set(key, []);
+        abonosPorDetalle.get(key)!.push(a);
+      }
+    }
+
+    let totalSaldo = 0;
+    const detalleConEstado = detalle.map((d: Record<string, unknown>) => {
+      const saldo = N(d.saldo);
+      const montoAPagar = N(d.neto_pagar) - N(d.total_descuentos);
+      totalSaldo += saldo;
+      return {
+        ...d,
+        estado_pago: saldo <= 0 ? 'pagado' : saldo < montoAPagar ? 'parcial' : 'pendiente',
+        abonos: abonosPorDetalle.get(N(d.id)) ?? [],
+      };
+    });
+
+    return { ...rows[0], detalle: detalleConEstado, total_saldo: r0(totalSaldo) };
   }
 
   /**
@@ -221,9 +303,16 @@ export class NominaService {
     const diasBase = dto.tipo === 'quincenal' ? 15 : 30;
 
     return this.dataSource.transaction(async (m) => {
-      const empleados = await m.query(
-        `SELECT * FROM nomina_empleados WHERE activo = 1 AND deleted_at IS NULL ORDER BY nombre ASC`,
-      );
+      const empleados = dto.empleados_ids?.length
+        ? await m.query(
+            `SELECT * FROM nomina_empleados
+              WHERE activo = 1 AND deleted_at IS NULL AND id IN (${dto.empleados_ids.map(() => '?').join(',')})
+              ORDER BY nombre ASC`,
+            dto.empleados_ids,
+          )
+        : await m.query(
+            `SELECT * FROM nomina_empleados WHERE activo = 1 AND deleted_at IS NULL ORDER BY nombre ASC`,
+          );
       if (!empleados.length) {
         throw new BadRequestException('No hay empleados activos para liquidar.');
       }
@@ -244,18 +333,28 @@ export class NominaService {
         tDev += c.total_devengado;
         tDed += c.total_deducciones;
         tNeto += c.neto_pagar;
-        await m.query(
+        const insDet = await m.query(
           `INSERT INTO nomina_detalle
              (periodo_id, empleado_id, empleado_nombre, empleado_documento, cargo, salario_base,
               dias_trabajados, salario_devengado, auxilio_transporte, total_devengado,
-              deduccion_salud, deduccion_pension, total_deducciones, neto_pagar)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              deduccion_salud, deduccion_pension, total_deducciones, neto_pagar, total_descuentos, saldo)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
           [
             periodoId, N(e.id), e.nombre, e.documento, e.cargo ?? null, salario,
             diasBase, c.salario_devengado, c.auxilio_transporte, c.total_devengado,
-            c.deduccion_salud, c.deduccion_pension, c.total_deducciones, c.neto_pagar,
+            c.deduccion_salud, c.deduccion_pension, c.total_deducciones, c.neto_pagar, c.neto_pagar,
           ],
         );
+        const detalleId = N(insDet.insertId);
+        // Descuentos comerciales que quedaron pendientes de un período anterior
+        // (ej. mercancía sacada) se cobran en esta nueva liquidación.
+        const aplicado = await this.aplicarDescuentosPendientes(m, N(e.id), detalleId, c.neto_pagar, username);
+        if (aplicado > 0) {
+          await m.query(
+            `UPDATE nomina_detalle SET total_descuentos = ?, saldo = ? WHERE id = ?`,
+            [aplicado, r0(c.neto_pagar - aplicado), detalleId],
+          );
+        }
       }
 
       await m.query(
@@ -277,20 +376,24 @@ export class NominaService {
     );
     const det = rows[0];
     if (!det) throw new NotFoundException(`Renglón ${detalleId} no encontrado.`);
-    if (det.periodo_estado === 'cerrada') {
+    if (det.periodo_estado !== 'borrador') {
       throw new BadRequestException('El período está cerrado y no se puede modificar.');
     }
     const p = await this.getParams();
     const c = this.calcular(N(det.salario_base), dias, p);
+    // El renglón sigue en borrador → nunca tuvo abonos, pero sí pudo haber
+    // recibido descuentos comerciales al crearse. Se preservan.
+    const nuevoSaldo = r0(c.neto_pagar - N(det.total_descuentos));
 
     await this.dataSource.transaction(async (m) => {
       await m.query(
         `UPDATE nomina_detalle SET dias_trabajados = ?, salario_devengado = ?, auxilio_transporte = ?,
-           total_devengado = ?, deduccion_salud = ?, deduccion_pension = ?, total_deducciones = ?, neto_pagar = ?
+           total_devengado = ?, deduccion_salud = ?, deduccion_pension = ?, total_deducciones = ?, neto_pagar = ?,
+           saldo = ?
          WHERE id = ?`,
         [
           dias, c.salario_devengado, c.auxilio_transporte, c.total_devengado,
-          c.deduccion_salud, c.deduccion_pension, c.total_deducciones, c.neto_pagar, detalleId,
+          c.deduccion_salud, c.deduccion_pension, c.total_deducciones, c.neto_pagar, nuevoSaldo, detalleId,
         ],
       );
       const tot = await m.query(
@@ -312,7 +415,7 @@ export class NominaService {
       [id],
     );
     if (!rows[0]) throw new NotFoundException(`Período ${id} no encontrado.`);
-    if (rows[0].estado === 'cerrada') {
+    if (rows[0].estado !== 'borrador') {
       throw new BadRequestException('El período ya está cerrado.');
     }
     await this.dataSource.query(
@@ -322,16 +425,172 @@ export class NominaService {
     return { mensaje: 'Período cerrado.' };
   }
 
+  /**
+   * Pago masivo: abona TODO el saldo pendiente de cada renglón del período
+   * (uno por empleado) con la misma fecha/medio. Es el atajo para cuando sí
+   * se paga a todos igual — para acuerdos individuales se usa registrarAbono
+   * renglón por renglón. Registro/trazabilidad, no mueve dinero real ni toca
+   * el módulo Pagos.
+   */
+  async pagarPeriodo(id: number, dto: PagarPeriodoDto, username?: string) {
+    return this.dataSource.transaction(async (m) => {
+      const rows = await m.query(
+        `SELECT estado FROM nomina_periodos WHERE id = ? LIMIT 1 FOR UPDATE`,
+        [id],
+      );
+      if (!rows[0]) throw new NotFoundException(`Período ${id} no encontrado.`);
+      if (rows[0].estado === 'borrador') {
+        throw new BadRequestException('Cerrá el período antes de marcarlo como pagado.');
+      }
+      const pendientes = await m.query(
+        `SELECT id, saldo FROM nomina_detalle WHERE periodo_id = ? AND saldo > 0 FOR UPDATE`,
+        [id],
+      );
+      if (!pendientes.length) {
+        throw new BadRequestException('Ya no hay saldo pendiente en este período.');
+      }
+      for (const row of pendientes) {
+        const monto = N(row.saldo);
+        await m.query(
+          `INSERT INTO nomina_abonos (detalle_id, monto, fecha, medio_pago, observaciones, created_by)
+           VALUES (?, ?, ?, ?, 'Pago masivo del período', ?)`,
+          [N(row.id), monto, dto.fecha_pago, dto.medio_pago, username ?? null],
+        );
+        await m.query(`UPDATE nomina_detalle SET saldo = 0 WHERE id = ?`, [N(row.id)]);
+      }
+      await m.query(
+        `UPDATE nomina_periodos SET estado = 'pagada', fecha_pago = ?, medio_pago = ?, pagado_por = ? WHERE id = ?`,
+        [dto.fecha_pago, dto.medio_pago, username ?? null, id],
+      );
+      return { mensaje: `Pago masivo registrado (${pendientes.length} empleados).` };
+    });
+  }
+
+  /**
+   * Abono parcial a UN renglón (empleado dentro de un período cerrado). Se
+   * puede llamar varias veces hasta saldar. Si con este abono se saldan TODOS
+   * los renglones del período, el período pasa a 'pagada' automáticamente.
+   */
+  async registrarAbono(detalleId: number, dto: RegistrarAbonoDto, username?: string) {
+    return this.dataSource.transaction(async (m) => {
+      const rows = await m.query(
+        `SELECT d.*, pe.estado AS periodo_estado
+           FROM nomina_detalle d JOIN nomina_periodos pe ON pe.id = d.periodo_id
+          WHERE d.id = ? LIMIT 1 FOR UPDATE`,
+        [detalleId],
+      );
+      const det = rows[0];
+      if (!det) throw new NotFoundException(`Renglón ${detalleId} no encontrado.`);
+      if (det.periodo_estado === 'borrador') {
+        throw new BadRequestException('Cerrá el período antes de registrar pagos.');
+      }
+      const saldo = N(det.saldo);
+      if (saldo <= 0) {
+        throw new BadRequestException('Este empleado ya no tiene saldo pendiente en este período.');
+      }
+      const monto = N(dto.monto);
+      if (monto > saldo + 0.01) {
+        throw new BadRequestException(`El abono no puede superar el saldo pendiente (${saldo}).`);
+      }
+      await m.query(
+        `INSERT INTO nomina_abonos (detalle_id, monto, fecha, medio_pago, observaciones, created_by)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [detalleId, monto, dto.fecha_pago, dto.medio_pago, dto.observaciones ?? null, username ?? null],
+      );
+      const nuevoSaldo = r0(saldo - monto);
+      await m.query(`UPDATE nomina_detalle SET saldo = ? WHERE id = ?`, [nuevoSaldo, detalleId]);
+
+      const pendientes = await m.query(
+        `SELECT COUNT(*) AS n FROM nomina_detalle WHERE periodo_id = ? AND saldo > 0`,
+        [det.periodo_id],
+      );
+      if (N(pendientes[0].n) === 0) {
+        await m.query(
+          `UPDATE nomina_periodos SET estado = 'pagada', fecha_pago = ?, medio_pago = ?, pagado_por = ? WHERE id = ?`,
+          [dto.fecha_pago, dto.medio_pago, username ?? null, det.periodo_id],
+        );
+      }
+      return { mensaje: 'Abono registrado.' };
+    });
+  }
+
+  // ── DESCUENTOS (mercancía sacada / acuerdos verbales) ───────────────────
+  /**
+   * Registra un descuento comercial a un empleado. Se intenta aplicar de
+   * inmediato contra el renglón más antiguo con saldo pendiente en un período
+   * YA CERRADO; si no hay ninguno (ej. ya le pagaron todo), queda 'pendiente'
+   * y se cobra automáticamente en la próxima liquidación (crearPeriodo).
+   */
+  async registrarDescuento(empleadoId: number, dto: RegistrarDescuentoDto, username?: string) {
+    await this.getEmpleado(empleadoId);
+    return this.dataSource.transaction(async (m) => {
+      const ins = await m.query(
+        `INSERT INTO nomina_descuentos (empleado_id, concepto, monto, fecha, estado, created_by)
+         VALUES (?, ?, ?, ?, 'pendiente', ?)`,
+        [empleadoId, dto.concepto, dto.monto, dto.fecha, username ?? null],
+      );
+      const target = await m.query(
+        `SELECT d.id, d.saldo FROM nomina_detalle d
+           JOIN nomina_periodos pe ON pe.id = d.periodo_id
+          WHERE d.empleado_id = ? AND pe.estado = 'cerrada' AND d.saldo > 0
+          ORDER BY pe.fecha_fin ASC, d.id ASC LIMIT 1 FOR UPDATE`,
+        [empleadoId],
+      );
+      if (target[0]) {
+        const detalleId = N(target[0].id);
+        const saldoActual = N(target[0].saldo);
+        const aplicado = await this.aplicarDescuentosPendientes(m, empleadoId, detalleId, saldoActual, username);
+        if (aplicado > 0) {
+          await m.query(
+            `UPDATE nomina_detalle SET total_descuentos = total_descuentos + ?, saldo = saldo - ? WHERE id = ?`,
+            [aplicado, aplicado, detalleId],
+          );
+        }
+      }
+      return { mensaje: 'Descuento registrado.', id: N(ins.insertId) };
+    });
+  }
+
+  /** Historial de descuentos de un empleado (o de todos si no se pasa id). */
+  async listarDescuentos(empleadoId?: number) {
+    if (empleadoId) {
+      return this.dataSource.query(
+        `SELECT d.*, pe.etiqueta AS aplicado_periodo_etiqueta
+           FROM nomina_descuentos d
+           LEFT JOIN nomina_detalle det ON det.id = d.aplicado_detalle_id
+           LEFT JOIN nomina_periodos pe ON pe.id = det.periodo_id
+          WHERE d.empleado_id = ?
+          ORDER BY d.estado ASC, d.fecha DESC, d.id DESC`,
+        [empleadoId],
+      );
+    }
+    return this.dataSource.query(
+      `SELECT d.*, e.nombre AS empleado_nombre, pe.etiqueta AS aplicado_periodo_etiqueta
+         FROM nomina_descuentos d
+         JOIN nomina_empleados e ON e.id = d.empleado_id
+         LEFT JOIN nomina_detalle det ON det.id = d.aplicado_detalle_id
+         LEFT JOIN nomina_periodos pe ON pe.id = det.periodo_id
+        ORDER BY d.estado ASC, d.fecha DESC, d.id DESC`,
+    );
+  }
+
   async eliminarPeriodo(id: number) {
     const rows = await this.dataSource.query(
       `SELECT estado FROM nomina_periodos WHERE id = ? LIMIT 1`,
       [id],
     );
     if (!rows[0]) throw new NotFoundException(`Período ${id} no encontrado.`);
-    if (rows[0].estado === 'cerrada') {
-      throw new BadRequestException('No se puede eliminar un período cerrado.');
+    if (rows[0].estado !== 'borrador') {
+      throw new BadRequestException('Solo se puede eliminar un período en borrador.');
     }
     await this.dataSource.transaction(async (m) => {
+      // Los descuentos que se hayan cobrado en este período (recién creado,
+      // todavía en borrador) vuelven a quedar 'pendiente' para no perderlos.
+      await m.query(
+        `UPDATE nomina_descuentos SET estado = 'pendiente', aplicado_detalle_id = NULL
+          WHERE aplicado_detalle_id IN (SELECT id FROM nomina_detalle WHERE periodo_id = ?)`,
+        [id],
+      );
       await m.query(`DELETE FROM nomina_detalle WHERE periodo_id = ?`, [id]);
       await m.query(`DELETE FROM nomina_periodos WHERE id = ?`, [id]);
     });

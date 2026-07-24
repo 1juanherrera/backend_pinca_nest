@@ -509,6 +509,23 @@ export class InventarioService {
   }
 
   // ── GET /movimientos ──
+  /**
+   * Lista de responsables para el filtro de Movimientos. Devuelve solo los
+   * usernames que realmente aparecen en `movimiento_inventario` (los únicos
+   * valores que el filtro puede matchear), con el nombre para mostrar.
+   * Accesible a cualquier usuario autenticado: no expone roles ni permisos,
+   * a diferencia de /roles/usuarios (solo-superadmin).
+   */
+  async responsables(): Promise<{ username: string; nombre: string | null }[]> {
+    return this.dataSource.query(
+      `SELECT DISTINCT mi.responsable AS username, u.nombre
+         FROM movimiento_inventario mi
+         LEFT JOIN usuarios u ON u.username = mi.responsable
+        WHERE mi.responsable IS NOT NULL AND mi.responsable <> ''
+        ORDER BY u.nombre IS NULL, u.nombre, mi.responsable`,
+    );
+  }
+
   async movimientos(
     filtros: Record<string, string | undefined>,
     page: number,
