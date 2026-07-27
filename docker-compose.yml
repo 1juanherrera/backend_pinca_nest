@@ -23,7 +23,8 @@ services:
       MYSQL_PASSWORD: ${DB_PASSWORD:-password}
       MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-password}
     volumes:
-      - pinca_db_data:/var/lib/mysql        # ← MISMA data real que el stack CI4
+      - pinca_db_data:/var/lib/mysql
+      - ./deploy/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     networks:
       - pinca-net
     restart: unless-stopped
@@ -88,8 +89,6 @@ networks:
     driver: bridge
 
 volumes:
-  # Volumen EXISTENTE con tu data real (lo creó el compose de CI4). external:true
-  # = no lo recrea ni borra; lo reusa tal cual. NUNCA hacer `down -v`.
   pinca_db_data:
     external: true
     name: pinca_backend_db_data

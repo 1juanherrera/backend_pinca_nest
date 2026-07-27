@@ -10,7 +10,9 @@ const limpiarNombre = (n: unknown) => String(n ?? '').replace(/\s*\([^)]*\)\s*$/
 const matchNombre = (mp: unknown, ip: unknown): number => {
   const a = upperTrim(mp); const b = limpiarNombre(ip);
   if (a === b) return 1;
-  if (b.includes(a) || a.includes(b)) return 2;
+  const shorter = Math.min(a.length, b.length);
+  const longer = Math.max(a.length, b.length);
+  if ((b.includes(a) || a.includes(b)) && shorter / longer >= 0.4) return 2;
   return 0;
 };
 // ── Formatter (réplica de App\Libraries\Formatter) ──
@@ -213,7 +215,7 @@ export class FormulacionesCostosService {
     const mpIds = [...new Set(materias.map((m) => N(m.item_general_id)))];
     const ph = mpIds.map(() => '?').join(',');
     const catalogo: Record<string, unknown>[] = await this.dataSource.query(
-      `SELECT ip.id_item_proveedor, ip.item_general_id, ip.nombre, ip.precio_unitario, ip.factor_conversion,
+      `SELECT ip.id_item_proveedor, ip.item_general_id, ip.nombre, ip.precio_unitario, ip.precio_con_iva, ip.factor_conversion,
               ip.proveedor_id, p.nombre_empresa, uc.nombre AS unidad_compra
          FROM item_proveedor ip
          INNER JOIN proveedor p ON p.id_proveedor = ip.proveedor_id
@@ -242,10 +244,11 @@ export class FormulacionesCostosService {
         else { const nm = matchNombre(mp.nombre, ip.nombre); if (nm === 1) priority = 2; else if (nm === 2) priority = 3; }
         if (priority < 999) {
           const factor = Math.max(Number(ip.factor_conversion) || 1, 0.001);
+          const precioIva = N(ip.precio_con_iva) || N(ip.precio_unitario);
           opciones.push({
             id_item_proveedor: N(ip.id_item_proveedor), nombre_item: ip.nombre, nombre_empresa: ip.nombre_empresa,
-            precio_unitario: N(ip.precio_unitario), factor_conversion: N(ip.factor_conversion),
-            precio_por_kg: round(N(ip.precio_unitario) / factor, 2), unidad_compra: ip.unidad_compra, match_tipo: priority,
+            precio_unitario: N(ip.precio_unitario), precio_con_iva: precioIva, factor_conversion: N(ip.factor_conversion),
+            precio_por_kg: round(precioIva / factor, 2), unidad_compra: ip.unidad_compra, match_tipo: priority,
           });
         }
       }
