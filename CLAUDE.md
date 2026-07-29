@@ -4,14 +4,16 @@
 >
 > Para guías de arquitectura/patrones más profundas, ver `GUIA_NESTJS_PINCA.md` (contrato JWT/RBAC, estructura de módulos).
 
-## 1. Estado actual (snapshot 2026-07-28)
+## 1. Estado actual (snapshot 2026-07-29)
 
 **Proyecto**: PINCA (Pinturas Industriales del Caribe S.A.S) — API del ERP.
 **Stack**: NestJS 11 + TypeORM 0.3 (`synchronize: false`, SQL mayormente crudo vía `dataSource.query`) + MySQL 8 + Passport-JWT + class-validator + Joi (validación de env) + Helmet + `@nestjs/schedule` (cron).
 
 **Migración CI4→NestJS: 100% completa.** No queda nada corriendo en CodeIgniter 4 — el stack unificado `pinca-erp` (ver §3) es NestJS sirviendo API + frontend estático + `/uploads`. El README y partes de `GUIA_NESTJS_PINCA.md` todavía describen la fase de convivencia con CI4 ("Fase 0/1", "strangler fig") — **está desactualizado**, no confiar en esas secciones para el estado actual.
 
-39 módulos en `src/modules/` (uno por dominio: `auth`, `usuarios`, `bodegas`, `catalogo`, `item`, `item-proveedor`, `inventario`, `bodega-inventario`, `formulaciones`, `formulaciones-costos`, `preparaciones`, `costos`, `costos-produccion`, `cotizaciones`, `remisiones`, `facturas`, `notas-credito`, `pagos-cliente`, `cartera`, `gestiones-cobro`, `clientes`, `proveedores`, `ordenes-compra`, `requisiciones`, `instalaciones`, `categorias`, `unidades`, `numeracion`, `configuracion`, `empresa`, `permisos`, `sincronizacion`, `trazabilidad`, `dashboard`, `salud-sistema`, `notificaciones`, `auditoria`, `search`, `comparador`, `nomina`).
+40 módulos en `src/modules/` (uno por dominio: `auth`, `usuarios`, `bodegas`, `catalogo`, `item`, `item-proveedor`, `inventario`, `bodega-inventario`, `formulaciones`, `formulaciones-costos`, `preparaciones`, `costos`, `costos-produccion`, `cotizaciones`, `remisiones`, `facturas`, `notas-credito`, `pagos-cliente`, `cartera`, `gestiones-cobro`, `clientes`, `proveedores`, `ordenes-compra`, `requisiciones`, `instalaciones`, `categorias`, `unidades`, `numeracion`, `configuracion`, `empresa`, `permisos`, `sincronizacion`, `trazabilidad`, `dashboard`, `salud-sistema`, `notificaciones`, `auditoria`, `search`, `comparador`, `nomina`, `facturacion-electronica`).
+
+**`facturacion-electronica` (nuevo, 2026-07-29, EN EVALUACIÓN — no confundir con `facturas`)**: cliente de la API de **Factus** (proveedor de facturación electrónica DIAN en evaluación). Módulo **aislado**: no toca la tabla `facturas` ni ningún otro módulo real — es un harness admin-only para seguir probando el sandbox del proveedor. Ver detalle en el historial de sesión (§7, 2026-07-29).
 
 ## 2. Comandos
 
@@ -104,3 +106,24 @@ Sesión pedida desde el lado frontend (ver `pinca_frontend/CLAUDE.md` de la mism
 **Cero cambios de código en este repo** — la sesión fue 100% de verificación. Todos los datos de prueba (`__TEST__`) fueron insertados y borrados via SQL directo, conteos verificados antes/después (0 residuo).
 
 **Este CLAUDE.md fue creado hoy** — antes no existía en este repo (el historial pre-2026-07-28 de trabajo hecho sobre este backend vive en `pinca_frontend/CLAUDE.md`, secciones §15 en adelante).
+
+### 2026-07-29 — Facturación electrónica DIAN: evaluación de Factus (Fase 0 + módulo aislado)
+
+Un proveedor de facturación electrónica (**Factus**, `factus.com.co`) mandó credenciales de sandbox v2 para evaluar integración. Sesión de **exploración + harness de prueba**, SIN tocar `facturas` ni ningún módulo real (decisión explícita del usuario: "nada todavía" hasta terminar de evaluar).
+
+**Fase 0 (manual, contra el sandbox real, sin código)**:
+- Auth OAuth2 "password grant" (Laravel Passport): `POST /oauth/token` form-urlencoded `grant_type=password + client_id/secret + username/password` → `access_token` (1h) + `refresh_token`.
+- El sandbox (`sandboxv2@factus.com.co`) es una cuenta **genérica compartida** entre todos los que evalúan el proveedor (empresa "FACTUS V2", NIT `1000789002`, San Gil-Santander) — NO es privada de PINCA. Ya trae 6 rangos de numeración precargados (Factura de Venta id=389 prefijo `SETP` resol. `18760000001` vigente hasta 2030, Documento Soporte id=2058, 2×Nota Crédito, Nota Débito, Nota de Ajuste).
+- **Creé y validé una factura de prueba con datos ficticios** usando `unit_measure_code:"94"` (otra unidad) y `standard_code:"999"` (sin clasificar) como fallback — **el DIAN la validó igual**, con CUFE real, QR y PDF/XML descargables. Esto baja mucho el costo estimado de mapear el catálogo de PINCA a códigos UNSPSC reales para un MVP.
+- Confirmado con un request roto a propósito: un **422 (error de formato) NO consume el consecutivo** del rango de numeración — seguro reintentar tras corregir. Un documento con `is_validated:true` puede traer avisos DIAN no bloqueantes en `data.errors` (ej. "NIT no coincide con RUT") — no es un fallo real, hay que leer `is_validated`/status HTTP, no "si `errors` viene vacío".
+- Analizada la colección Postman oficial (67 requests) que el proveedor mandó por separado: la API cubre bastante más que facturas de venta — notas crédito/débito, **documento soporte** (autofactura para compras a proveedores no obligados a facturar — aplica al lado de `ordenes-compra`/`proveedores`, no solo ventas), lookup de adquirente por NIT contra DIAN (`/v2/dian/acquirer`, en sandbox devuelve datos mock), y **nómina electrónica DIAN** (`/v2/payrolls/*` — es una obligación legal DISTINTA del módulo `Nomina` interno de PINCA, que solo liquida/paga; no confundir ni mezclar alcance sin pedido explícito).
+
+**Módulo nuevo `facturacion-electronica`** (aislado, admin-only vía `@Roles('admin')` a nivel de clase, igual que `nomina`):
+- `factus.service.ts` — maneja el ciclo de vida del token (login password-grant, cache en memoria con buffer de 60s, `refresh_token` antes de re-loguear, reintento automático de 1 vez si un request da 401), wrapper `request()` que traduce errores 4xx de Factus (incl. el detalle campo-por-campo de los 422) a `BadRequestException` — así el `HttpExceptionFilter` global los devuelve en el shape `{ok:false, msg}` de siempre.
+- `dto/factura-electronica.dto.ts` — DTOs con class-validator para factura y nota crédito (`customer`, `items[]` con `taxes[]`, `payment_details[]` — este último **obligatorio**, Factus lo exige siempre aunque parezca opcional a simple vista).
+- `facturacion-electronica.controller.ts` — endpoints de prueba: `GET empresa`, `GET rangos-numeracion`, `POST facturas` (crea+valida), `GET facturas/:number`, `GET facturas/:number/pdf` y `/xml` (devuelven el **binario real** con `Content-Type` correcto, no el JSON en base64 que entrega Factus — se decodifica en el service), `POST notas-credito`, `GET notas-credito/:number`.
+- Config: `FACTUS_*` en `.env` (mismo patrón que `OPENROUTER_*` — no está en el schema Joi porque es opcional/en evaluación) + pasadas en `docker-compose.yml`. IDs de rango de numeración del sandbox como default (`FACTUS_NUMBERING_RANGE_FACTURA=389`, `FACTUS_NUMBERING_RANGE_NOTA_CREDITO=390`), overrideables por request.
+
+**Validado en runtime (Docker, `pinca-erp-api`)**: los 3 endpoints de lectura + crear factura + descargar PDF (`application/pdf` real, no JSON) + descargar XML (UBL 2.0 válido) — todos probados con JWT admin real contra el módulo ya wireado en `app.module.ts`, no contra scripts sueltos. Un bug propio detectado y corregido en el camino: el campo interno `_httpStatus` que usaba para pasar el status HTTP junto al JSON se filtraba en la respuesta al frontend — `fetchJson()` ahora devuelve `{status, json}` en vez de mutar el JSON.
+
+**Pendiente** (explícitamente diferido por el usuario): NO tocar/ocultar el módulo `facturas` interno hasta terminar de probar Factus de punta a punta. Próximos pasos cuando se retome: cerrar los gaps de datos reales en `clientes` (`identification_document_code`, `legal_organization_code`, `tribute_code`, `municipality_code` — hoy no existen en `Cliente` entity) antes de conectar esto al flujo real de `facturas`.

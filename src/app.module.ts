@@ -44,6 +44,7 @@ import { CostosProduccionModule } from './modules/costos-produccion/costos-produ
 import { BodegaInventarioModule } from './modules/bodega-inventario/bodega-inventario.module';
 import { FormulacionesCostosModule } from './modules/formulaciones-costos/formulaciones-costos.module';
 import { NominaModule } from './modules/nomina/nomina.module';
+import { FacturacionElectronicaModule } from './modules/facturacion-electronica/facturacion-electronica.module';
 
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { VisorReadonlyGuard } from './common/guards/visor-readonly.guard';
@@ -130,6 +131,9 @@ import { HealthController } from './health.controller';
     FormulacionesCostosModule,
     // RRHH — nómina básica (empleados + liquidación por período, admin-only):
     NominaModule,
+    // Facturación electrónica DIAN (Factus, EN EVALUACIÓN — aislado, no toca `facturas`
+    // ni ningún otro módulo real todavía; admin-only, harness de prueba):
+    FacturacionElectronicaModule,
   ],
   controllers: [HealthController],
   providers: [
