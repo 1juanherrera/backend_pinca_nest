@@ -1,11 +1,12 @@
 # db-backup — PINCA ERP
 
-Backups completos (esquema + datos + rutinas/triggers/eventos) de la base de datos `gestorpincadb` del stack `pinca-erp` (NestJS unificado). Repo separado a propósito — los backups no van en el historial de `pinca_backend_nest` (esa carpeta `backups/` está en `.gitignore` ahí), para no ensuciar el repo de código con dumps pesados y poder clonar/traer solo la data a otra máquina.
+Backups completos (esquema + datos + rutinas/triggers/eventos) de la base de datos `gestorpincadb` del stack `pinca-erp` (NestJS unificado). A diferencia de la carpeta `backups/` (gitignored, snapshots de trabajo intermedios pre-migración/pre-cambios de schema), **`db-backup/` SÍ se commitea** — es la carpeta convenida para poder clonar el repo en otra máquina y traer la data completa junto con el código.
 
 ## Archivos
 
 | Archivo | Fecha | Notas |
 |---|---|---|
+| `gestorpincadb_2026-07-27.sql` | 2026-07-27 | Snapshot post-migración CI4→NestJS. |
 | `gestorpincadb_2026-07-31.sql` | 2026-07-31 | 58/58 tablas, incluye datos + rutinas/triggers/eventos. Generado con `mysqldump --single-transaction --routines --triggers --events`. |
 
 ## Cómo se generó
@@ -41,4 +42,4 @@ docker exec -i pinca-erp-db mysql -uroot -ppassword gestorpincadb < gestorpincad
 - Root: `password` (NO `rootpassword`, ver `pinca_backend_nest/CLAUDE.md`)
 - DB: `gestorpincadb`
 
-⚠️ Este repo va a contener datos reales de PINCA (clientes, proveedores, inventario, costos). Tratarlo como confidencial — no lo subas a un remoto público.
+⚠️ Esta carpeta contiene datos reales de PINCA (clientes, proveedores, inventario, costos). Tratarla como confidencial — el repo de `pinca_backend_nest` no debe subirse a un remoto público mientras `db-backup/` siga versionado ahí.
