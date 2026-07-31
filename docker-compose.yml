@@ -66,6 +66,9 @@ services:
       FACTUS_PASSWORD: ${FACTUS_PASSWORD:-}
       FACTUS_NUMBERING_RANGE_FACTURA: ${FACTUS_NUMBERING_RANGE_FACTURA:-}
       FACTUS_NUMBERING_RANGE_NOTA_CREDITO: ${FACTUS_NUMBERING_RANGE_NOTA_CREDITO:-}
+      # Tirilla ESC/POS por red — impresora térmica del cliente (ver §7 CLAUDE.md).
+      PRINTER_IP: ${PRINTER_IP:-}
+      PRINTER_PORT: ${PRINTER_PORT:-9100}
       # Nest sirve el SPA desde acá (Opción A). El dist se monta abajo.
       FRONTEND_DIST: /usr/src/app/frontend-dist
     volumes:

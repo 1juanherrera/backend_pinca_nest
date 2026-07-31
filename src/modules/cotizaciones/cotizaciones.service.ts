@@ -52,7 +52,8 @@ export class CotizacionesService {
       }
   > {
     const N = (x: unknown) => Number(x ?? 0);
-    const baseSelect = `SELECT co.*, c.nombre_empresa, c.nombre_encargado, f.numero AS numero_factura
+    const baseSelect = `SELECT co.*, c.nombre_empresa, c.nombre_encargado, f.numero AS numero_factura,
+                c.numero_documento AS nit_cliente, c.ciudad, c.direccion
          FROM cotizaciones co
          LEFT JOIN clientes c ON c.id_clientes = co.cliente_id
          LEFT JOIN facturas f ON f.id_facturas = co.facturas_id`;
@@ -134,7 +135,8 @@ export class CotizacionesService {
   /** GET /cotizaciones/:id → objeto crudo (header + datos cliente). */
   async findOne(id: number): Promise<Record<string, unknown>> {
     const rows: Record<string, unknown>[] = await this.dataSource.query(
-      `SELECT co.*, c.nombre_empresa, c.nombre_encargado, c.email, c.telefono
+      `SELECT co.*, c.nombre_empresa, c.nombre_encargado, c.email, c.telefono,
+              c.numero_documento AS nit_cliente, c.ciudad, c.direccion
          FROM cotizaciones co
          LEFT JOIN clientes c ON c.id_clientes = co.cliente_id
         WHERE co.id_cotizaciones = ? AND co.deleted_at IS NULL`,

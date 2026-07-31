@@ -147,6 +147,7 @@ export class OrdenesCompraService {
   async detalle(id: number): Promise<Record<string, unknown>> {
     const headers: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT oc.*, p.nombre_empresa, p.nombre_encargado, p.telefono, p.email,
+              p.numero_documento AS nit_proveedor, p.direccion AS direccion_proveedor,
               b.nombre AS bodega_nombre
          FROM ordenes_compra oc
          LEFT JOIN proveedor p ON p.id_proveedor = oc.proveedor_id

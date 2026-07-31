@@ -2,6 +2,7 @@ import { Body, Controller, Get, Param, Post, Res } from '@nestjs/common';
 import type { Response } from 'express';
 
 import { FactusService } from './factus.service';
+import { TirillaService } from './tirilla.service';
 import { CrearFacturaElectronicaDto, CrearNotaCreditoElectronicaDto } from './dto/factura-electronica.dto';
 import { Roles } from '../../common/decorators/roles.decorator';
 
@@ -13,7 +14,10 @@ import { Roles } from '../../common/decorators/roles.decorator';
 @Controller('facturacion-electronica')
 @Roles('admin')
 export class FacturacionElectronicaController {
-  constructor(private readonly factus: FactusService) {}
+  constructor(
+    private readonly factus: FactusService,
+    private readonly tirilla: TirillaService,
+  ) {}
 
   @Get('empresa')
   empresa() {
@@ -62,6 +66,21 @@ export class FacturacionElectronicaController {
       'Content-Disposition': `inline; filename="${fileName}"`,
     });
     res.send(buffer);
+  }
+
+  @Get('facturas/:number/tirilla/preview')
+  async previsualizarTirilla(@Param('number') number: string, @Res() res: Response) {
+    const factura = await this.factus.getFactura(number);
+    const texto = this.tirilla.previsualizar(factura);
+    res.set({ 'Content-Type': 'text/plain; charset=utf-8' });
+    res.send(texto);
+  }
+
+  @Post('facturas/:number/tirilla/imprimir')
+  async imprimirTirilla(@Param('number') number: string) {
+    const factura = await this.factus.getFactura(number);
+    await this.tirilla.imprimir(factura);
+    return { impresa: true, number };
   }
 
   @Post('notas-credito')

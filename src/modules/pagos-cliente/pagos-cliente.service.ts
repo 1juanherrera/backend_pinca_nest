@@ -29,7 +29,8 @@ export class PagosClienteService {
 
   private baseSelect(where: string, params: unknown[]): Promise<Record<string, unknown>[]> {
     return this.dataSource.query(
-      `SELECT p.*, c.nombre_empresa, c.nombre_encargado, f.numero AS numero_factura
+      `SELECT p.*, c.nombre_empresa, c.nombre_encargado, c.numero_documento AS nit_cliente,
+              f.numero AS numero_factura
          FROM pagos_cliente p
          LEFT JOIN clientes c ON c.id_clientes = p.clientes_id
          LEFT JOIN facturas f ON f.id_facturas = p.facturas_id
@@ -99,7 +100,8 @@ export class PagosClienteService {
     const total = Number(countRow?.total ?? 0);
 
     const data: Record<string, unknown>[] = await this.dataSource.query(
-      `SELECT p.*, c.nombre_empresa, c.nombre_encargado, f.numero AS numero_factura
+      `SELECT p.*, c.nombre_empresa, c.nombre_encargado, c.numero_documento AS nit_cliente,
+              f.numero AS numero_factura
          ${joinFrom} ${whereSql}
         ORDER BY p.fecha_pago DESC
         LIMIT ? OFFSET ?`,
