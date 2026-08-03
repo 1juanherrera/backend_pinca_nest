@@ -145,6 +145,16 @@ Sesión de seguimiento a la evaluación de Factus. Dos preguntas del usuario: (1
 
 **Pendiente**: cuando el usuario tenga la IP real de la impresora del cliente, setear `PRINTER_IP` en `.env` + `docker compose up -d --force-recreate -V api` (o simple `docker restart` si el contenedor ya tiene el node_modules correcto) y probar `POST .../tirilla/imprimir` de punta a punta. Revisar si `PC858_EURO` renderiza bien los acentos en el modelo real (no todos los clones ESC/POS soportan el mismo codepage). Reintentar el logo de Factus más adelante o reportarlo a su soporte.
 
+### 2026-08-03 — Nómina Electrónica DIAN vía Factus: BLOQUEADA (cuenta sin habilitar)
+
+El usuario pidió implementar Nómina Electrónica DIAN vía Factus (`/v2/payrolls`), reemplazando el cálculo del módulo interno `nomina` **sin borrarlo**. Antes de escribir código se probó el sandbox real (mismas credenciales `.env` de `facturacion-electronica`):
+
+- `GET /v2/payrolls` responde OK — hay 1 documento de otro evaluador de la cuenta compartida (`reference_code 990000039`, número `NEF1`, worker con `identification_document`/`worker_type`/`contract_type`/`payment_method`, `totals.deduction/accruals/paid`).
+- `POST /v2/payrolls` (crear) devuelve `403 Forbidden`: `"La empresa no tiene habilitada la creación de este documento"`. La cuenta sandbox compartida **no tiene activo el producto Nómina Electrónica para creación** (solo lectura del documento ajeno que ya existe) — en Colombia esto requiere su propia habilitación/resolución DIAN, separada de la de facturación de venta, probablemente con plan/costo aparte en Factus.
+- No se pudo determinar la ruta de detalle por número/id (`GET /v2/payrolls/{number}` y `/{id}` dieron 404) ni el payload de creación — sin poder crear, no hay 422 de validación campo-por-campo que reverse-engineerear (a diferencia de como se hizo con `facturas`).
+
+**Cero cambios de código** — decisión explícita del usuario de pausar y gestionar primero con soporte de Factus la habilitación en la cuenta, antes de escribir el módulo. `nomina_empleados` seguirá necesitando campos nuevos cuando se retome (tipo de documento/contrato/jornada, EPS, fondo de pensión, ARL, fondo de cesantías, método de pago) — no existen hoy.
+
 ### 2026-07-30/31 — Gaps de datos en cotizaciones/OC/pagos (NIT, ciudad, dirección)
 
 Disparado desde el lado frontend: al construir un layout alternativo de PDF (estilo Factus, ver `pinca_frontend/CLAUDE.md`) se detectó que varios campos legales del cliente/proveedor salían siempre vacíos en los PDFs (incluidos los formatos Carta/Tiquete ya existentes, no solo el nuevo) porque las queries de listado/detalle nunca los traían del JOIN. Bug preexistente, no introducido en esta sesión.
