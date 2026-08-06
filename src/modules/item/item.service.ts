@@ -1,5 +1,5 @@
 import { HttpException, Injectable } from '@nestjs/common';
-import { DataSource, EntityManager } from 'typeorm';
+import { DataSource } from 'typeorm';
 
 /**
  * Réplica fiel de ItemController + ItemModel (CI4) — controller LEGACY /item_general.

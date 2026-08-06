@@ -79,7 +79,7 @@ async function bootstrap() {
       }
       res.sendFile(indexHtml);
     });
-    // eslint-disable-next-line no-console
+
     console.log(`[PINCA-Nest] sirviendo frontend desde ${frontendDist}`);
   }
 
@@ -117,7 +117,7 @@ async function bootstrap() {
 
   const port = config.get<number>('port') ?? 3000;
   await app.listen(port);
-  // eslint-disable-next-line no-console
+
   console.log(`[PINCA-Nest] escuchando en http://localhost:${port}/api`);
 }
 

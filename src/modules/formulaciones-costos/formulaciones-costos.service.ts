@@ -37,7 +37,7 @@ const fromCOP = (v: unknown): number => {
   if (typeof v === 'number') return v;
   const s = String(v ?? '');
   if (isNumericLike(s) && !s.includes('.') && !s.includes(',')) return Number(s);
-  const limpio = s.trim().replace(/\$|COP|cop| |\.| /g, '').replace(/,/g, '.');
+  const limpio = s.trim().replace(/\$|COP|cop| |\.|\u00A0/g, '').replace(/,/g, '.');
   return Number(limpio) || 0;
 };
 

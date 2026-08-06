@@ -8,7 +8,6 @@ import { DataSource, EntityManager } from 'typeorm';
 import { CapasService, Consumo, MOV } from '../inventario/capas.service';
 import {
   CreatePreparacionDto,
-  PrepDetalleDto,
   UpdatePreparacionDto,
 } from './dto/preparacion.dto';
 
