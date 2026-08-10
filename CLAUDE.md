@@ -166,3 +166,35 @@ Disparado desde el lado frontend: al construir un layout alternativo de PDF (est
 Ningún cambio de shape rompe nada existente — son columnas nuevas agregadas al SELECT, no renombradas ni quitadas. **Validado en runtime** (Docker, `docker restart pinca-erp-api` + JWT admin minteado): `GET /ordenes_compra/45/detalle` (OC-003, proveedor real BRENNTAG COLOMBIA) devuelve `nit_proveedor: "860002590-1"` y `direccion_proveedor` correctos; para cotizaciones se insertó una fila `__TEST__COT-0001` (cliente real id 1, Distribuidora Andina), se confirmó `nit_cliente: "900123456"` vía `GET /cotizaciones`, y se borró después (0 residuo). `typecheck` limpio en los 3 archivos.
 
 No se tocó nada de `facturas` — ese módulo ya tenía sus propios JOIN completos desde antes.
+
+### 2026-08-10 — Limpieza/refactor general + bug real de costeo (IVA + matching de proveedor)
+
+Sesión disparada por `/goal` de limpieza de código (buscar y eliminar código no usado, console.logs de depuración, sugerir refactor de funciones complejas). Auditoría inicial: **el backend ya estaba limpio** — ESLint (`@typescript-eslint/no-unused-vars`) 0 issues en 177 archivos, 0 código comentado muerto, 0 archivos/exports huérfanos. Único hallazgo: `@nestjs/jwt` declarado en `package.json` pero nunca usado (la auth firma/verifica JWT a mano con `jsonwebtoken`) — reportado, no removido (tocar `package.json`/lockfile es un cambio de mayor alcance, se dejó como sugerencia).
+
+**Refactors puros (sin cambio de comportamiento) en las 3 funciones más largas/complejas del backend**, extrayendo métodos privados nombrados, validados con `tsc --noEmit` + ESLint + comparación de respuestas HTTP antes/después en Docker (git stash del cambio → capturar respuesta original → restaurar → comparar):
+
+- **`costos-produccion.service.ts::getCostosProduccionBatch`** (177 líneas → helpers `fetchProductosConFormula`, `fetchIngredientesPorFormulas`, `fetchStockPorMp`, `fetchProveedoresPorMp`, `calcularCostoProducto`, `calcularCobertura`). Read-only, bajo riesgo. Respuesta **idéntica byte a byte** antes/después.
+- **`preparaciones.service.ts::create`** (161 líneas → `validarUnidad`, `validarItemActivo`, `resolverFormulacionActiva`, `resolverVersionId`, `obtenerIngredientes`, `parseDetalleYCapas`, `calcularFactorVolumen`, `insertarPreparacion`, `insertarDetalleIngredientes`, `insertarCostosIndirectos`). Transaccional. Validado creando una preparación real (item 1, BARNIZ TRANSPARENTE, 5 gal) con el código refactorizado y con el original (vía `git stash`), comparando el JSON de respuesta — idéntico. Cancelada y limpiado el residuo (0 filas remanentes).
+- **`preparaciones.service.ts::ajustarInventario`** (179 líneas → `fetchIngredientesConCosto`, `resolverConsumoCapas`, `upsertInventarioLegacy`, `resolverLoteSnapshot`, `registrarCostoCongelado`). La más crítica (dinero + stock + consumo de capas). Validado en 3 modos reales contra Docker: legacy sin capas (item 1), FIFO automático (item 297/ETHYL SILICATO, capas 36/85), y selección MANUAL explícita de capa — los 3 con reintegro exacto al cancelar y cero residuo. Comparado también contra el código original vía `git stash` para el camino FIFO — idéntico.
+
+### Bug real encontrado a partir de una pregunta del usuario ("¿por qué me da otros valores la interfaz?")
+
+Al generar unos documentos de costeo para cliente (ver `pinca_frontend/CLAUDE.md` de la misma fecha) usando `GET /costos-produccion/:id`, los números no coincidían con lo que mostraba la pantalla de Formulaciones real. Investigación llevó a encontrar que **dos servicios calculan "el precio de un insumo" con 3 criterios distintos**:
+
+1. **IVA**: `costos-produccion.service.ts` usaba `ip.precio_unitario` (sin IVA); `formulaciones-costos.service.ts::getOpcionesProveedorFormulacion` (la fuente real que alimenta Formulaciones) usa `ip.precio_con_iva` (con fallback a `precio_unitario` si no hay IVA cargado).
+2. **Prioridad de proveedor**: `costos-produccion` priorizaba proveedores **vinculados directo** (`item_proveedor.item_general_id = mp_id`) sobre coincidencias por nombre, aunque no fueran los más baratos; `formulaciones-costos` deja ganar **al más barato siempre**, vinculado o no.
+3. **`matchNombre`** (heurística de coincidencia por nombre cuando no hay vínculo directo): la de `costos-produccion` no tenía guarda de longitud → matcheaba falsos positivos como "ACRONAL" dentro de "COLARCRYL ACRONAL 50" (un producto totalmente distinto). La de `formulaciones-costos` sí tiene la guarda `shorter/longer >= 0.4` que rechaza ese caso.
+
+**Decisión del usuario** (confirmada explícitamente): el criterio de `formulaciones-costos`/Formulaciones es el correcto — con IVA, el más barato siempre gana, y con la guarda de longitud en el nombre. **Corregido `costos-produccion.service.ts`** (afecta `getCostosProduccionBatch` vía `fetchProveedoresPorMp` y `getCostoProduccionDetalle` que tiene su propio bloque duplicado) para igualar exactamente ese criterio. Validado ingrediente por ingrediente contra `GET /formulaciones/:id/opciones-ingredientes` para los productos 461 y 462 — **17/17 y 16/16 coinciden exacto** tras el fix (antes había 1 mismatch por producto, siempre el mismo patrón ACRONAL/DIOXIDO DE TITANIO).
+
+### Bug real #2 (frontend, ver detalle en `pinca_frontend/CLAUDE.md`): `parseCOP` faltante en `FormulacionesTable.jsx`
+
+De paso se encontró que el total mostrado en Formulaciones seguía sin coincidir por ~$9.600 (el valor exacto del AGUA) incluso después del fix de arriba — causa: el campo `costo_total_materia` que devuelve `calculateCosts` viene pre-formateado en pesos colombianos como *string* (`toCOP()`, ej. `"9.600"`), y el frontend hacía `Number("9.600")` → **9.6** (JS interpreta el punto como decimal, no como separador de miles) en vez de 9600. Afecta a cualquier insumo sin proveedor vinculado (hoy solo el agua, pero el patrón es peligroso si algún insumo caro se queda sin proveedor). Fix del lado frontend con `parseCOP` (ver ese repo).
+
+### Dato (no código): `costos_item.volumen` NULL en VIN461/462
+
+Los dos productos nuevos cargados por foto de libreta (`memoria del asistente`, sesión previa) nunca tuvieron seteado `costos_item.volumen` (volumen base en galones que rinde la receta) → NULL → el backend asumía 1 galón por defecto (`COALESCE(NULLIF(volumen,0),1)`), lo que multiplicaba el costo ×100 al simular un lote real. **No es un bug de código** — es un dato faltante. Se insertaron las filas `costos_item` para item 461 y 462 con `volumen=100` directo en la BD (no vía migración/seed versionado — cambio de dato en runtime, confirmado por el usuario).
+
+**Validado**: `tsc --noEmit` limpio en los 3 archivos tocados, ESLint 0 issues, `docker restart pinca-erp-api` + comparación de respuestas reales para cada fix.
+
+**Pendiente**: ninguno de código en este repo. Los 3 refactors + 2 bugs quedaron cerrados y validados en runtime.

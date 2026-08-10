@@ -111,6 +111,203 @@ export class PreparacionesService {
     };
   }
 
+  /** Valida que la unidad exista y esté activa; devuelve su escala. */
+  private async validarUnidad(m: EntityManager, unidadId: number): Promise<number> {
+    const unidadRows: { escala: string }[] = await m.query(
+      `SELECT escala FROM unidad WHERE id_unidad = ? AND estados = 1`,
+      [unidadId],
+    );
+    if (!unidadRows.length) {
+      throw new BadRequestException(
+        `Unidad con ID ${unidadId} no encontrada o inactiva.`,
+      );
+    }
+    return Number(unidadRows[0].escala);
+  }
+
+  /** Valida que el item a producir exista y no esté archivado. */
+  private async validarItemActivo(m: EntityManager, itemId: number): Promise<void> {
+    const itemActivo: unknown[] = await m.query(
+      `SELECT id_item_general FROM item_general WHERE id_item_general = ? AND deleted_at IS NULL LIMIT 1`,
+      [itemId],
+    );
+    if (!itemActivo.length) {
+      throw new BadRequestException(
+        'El item a producir no existe o fue archivado.',
+      );
+    }
+  }
+
+  /** Formulación activa (estado=1) del item; lanza si no hay ninguna. */
+  private async resolverFormulacionActiva(
+    m: EntityManager,
+    itemId: number,
+  ): Promise<{ id_formulaciones: number; version_actual: number }> {
+    const formRows: { id_formulaciones: number; version_actual: number }[] =
+      await m.query(
+        `SELECT f.id_formulaciones, f.version_actual FROM formulaciones f
+           INNER JOIN item_general ig ON ig.id_item_general = f.item_general_id
+          WHERE f.item_general_id = ? AND f.estado = 1 AND ig.deleted_at IS NULL LIMIT 1`,
+        [itemId],
+      );
+    if (!formRows.length) {
+      throw new BadRequestException('El item no tiene una formulación activa.');
+    }
+    return formRows[0];
+  }
+
+  /** ID de `formulaciones_versiones` correspondiente a version_actual, o null si no aplica. */
+  private async resolverVersionId(
+    m: EntityManager,
+    formulacion: { id_formulaciones: number; version_actual: number },
+  ): Promise<number | null> {
+    if (!formulacion.version_actual) return null;
+    const verRows: { id: number }[] = await m.query(
+      `SELECT id FROM formulaciones_versiones WHERE formulacion_id = ? AND version_num = ?`,
+      [formulacion.id_formulaciones, formulacion.version_actual],
+    );
+    return verRows.length ? Number(verRows[0].id) : null;
+  }
+
+  /** Ingredientes activos de la formulación; lanza si no tiene ninguno. */
+  private async obtenerIngredientes(
+    m: EntityManager,
+    formulacionId: number,
+  ): Promise<{ item_general_id: number; cantidad: string }[]> {
+    const ingredientes: { item_general_id: number; cantidad: string }[] =
+      await m.query(
+        `SELECT igf.item_general_id, igf.cantidad
+           FROM item_general_formulaciones igf
+           INNER JOIN item_general ig ON ig.id_item_general = igf.item_general_id
+          WHERE igf.formulaciones_id = ? AND ig.deleted_at IS NULL`,
+        [formulacionId],
+      );
+    if (!ingredientes.length) {
+      throw new BadRequestException(
+        'La formulación no tiene ingredientes asignados (o fueron archivados).',
+      );
+    }
+    return ingredientes;
+  }
+
+  /** detalleMap (cantidad por ingrediente) + capasSeleccion (modo de consumo), desde el body. */
+  private parseDetalleYCapas(
+    dto: CreatePreparacionDto,
+  ): { detalleMap: Map<number, number>; capasSeleccion: Map<number, CapaSel> } {
+    const detalleMap = new Map<number, number>();
+    const capasSeleccion = new Map<number, CapaSel>();
+    for (const d of dto.detalle ?? []) {
+      const dId = Number(d.item_general_id);
+      if (dId) {
+        detalleMap.set(dId, Number(d.cantidad));
+        if (
+          d.modo_consumo !== undefined ||
+          d.capas !== undefined ||
+          d.bodega_id !== undefined ||
+          d.proveedor_id !== undefined
+        ) {
+          capasSeleccion.set(dId, {
+            modo: d.modo_consumo ?? 'FIFO',
+            capas: d.capas ?? [],
+            bodega_id: d.bodega_id != null ? Number(d.bodega_id) : null,
+            proveedor_id: d.proveedor_id != null ? Number(d.proveedor_id) : null,
+          });
+        }
+      }
+    }
+    return { detalleMap, capasSeleccion };
+  }
+
+  /** Factor de escalado de la fórmula base al volumen pedido — solo si NO hay detalle precalculado. */
+  private async calcularFactorVolumen(
+    m: EntityManager,
+    itemId: number,
+    volumenGalones: number,
+    detalleMap: Map<number, number>,
+  ): Promise<number> {
+    if (detalleMap.size !== 0) return 1;
+    const ci: { volumen_base: string }[] = await m.query(
+      `SELECT COALESCE(NULLIF(volumen,0),1) AS volumen_base FROM costos_item WHERE item_general_id = ? LIMIT 1`,
+      [itemId],
+    );
+    const volumenBase = Number(ci[0]?.volumen_base ?? 1);
+    return volumenBase > 0 ? volumenGalones / volumenBase : 1;
+  }
+
+  /** INSERT de la cabecera `preparaciones`; devuelve el id generado. */
+  private async insertarPreparacion(
+    m: EntityManager,
+    dto: CreatePreparacionDto,
+    cantidadEnvases: number,
+    itemId: number,
+    formulacionVersionId: number | null,
+    unidadId: number,
+  ): Promise<number> {
+    const insPrep: { insertId: number } = await m.query(
+      `INSERT INTO preparaciones
+         (fecha_creacion, fecha_inicio, fecha_fin, cantidad, observaciones, estado, item_general_id, formulacion_version_id, unidad_id)
+       VALUES (NOW(), ?, ?, ?, ?, 0, ?, ?, ?)`,
+      [
+        dto.fecha_inicio ?? null,
+        dto.fecha_fin ?? null,
+        cantidadEnvases,
+        dto.observaciones ?? null,
+        itemId,
+        formulacionVersionId,
+        unidadId,
+      ],
+    );
+    return insPrep.insertId;
+  }
+
+  /** INSERT de `preparaciones_has_item_general` por cada ingrediente de la fórmula. */
+  private async insertarDetalleIngredientes(
+    m: EntityManager,
+    preparacionId: number,
+    ingredientes: { item_general_id: number; cantidad: string }[],
+    detalleMap: Map<number, number>,
+    factorVolumen: number,
+    totalCantidadBase: number,
+  ): Promise<void> {
+    for (const ing of ingredientes) {
+      const ingId = Number(ing.item_general_id);
+      const cantidadEscalada = detalleMap.has(ingId)
+        ? this.r4(detalleMap.get(ingId) as number)
+        : this.r4(Number(ing.cantidad) * factorVolumen);
+      const porcentaje =
+        totalCantidadBase > 0
+          ? this.r4((Number(ing.cantidad) / totalCantidadBase) * 100)
+          : 0;
+      await m.query(
+        `INSERT INTO preparaciones_has_item_general
+           (preparaciones_id_preparaciones, item_general_id, cantidad, porcentajes)
+         VALUES (?, ?, ?, ?)`,
+        [preparacionId, ingId, cantidadEscalada, porcentaje],
+      );
+    }
+  }
+
+  /** INSERT de `preparaciones_costos_indirectos` por cada costo indirecto válido del body. */
+  private async insertarCostosIndirectos(
+    m: EntityManager,
+    preparacionId: number,
+    costosIndirectos: { nombre: string; categoria?: string; valor_aplicado: number }[],
+  ): Promise<void> {
+    for (const ci of costosIndirectos) {
+      const nombre = (ci.nombre ?? '').trim();
+      const categoria = (ci.categoria ?? 'otros').trim();
+      const valor = Number(ci.valor_aplicado ?? 0);
+      if (nombre && valor > 0) {
+        await m.query(
+          `INSERT INTO preparaciones_costos_indirectos
+             (preparaciones_id, costos_indirectos_id, valor_aplicado, nombre, categoria)
+           VALUES (?, NULL, ?, ?, ?)`,
+          [preparacionId, valor, nombre, categoria],
+        );
+      }
+    }
+  }
+
   // ── CREATE ──
   async create(
     dto: CreatePreparacionDto,
@@ -124,148 +321,25 @@ export class PreparacionesService {
     }
 
     const prepId = await this.dataSource.transaction(async (m) => {
-      const unidadRows: { escala: string }[] = await m.query(
-        `SELECT escala FROM unidad WHERE id_unidad = ? AND estados = 1`,
-        [unidadId],
-      );
-      if (!unidadRows.length) {
-        throw new BadRequestException(
-          `Unidad con ID ${unidadId} no encontrada o inactiva.`,
-        );
-      }
-      const escala = Number(unidadRows[0].escala);
+      const escala = await this.validarUnidad(m, unidadId);
       const cantidadEnvases = escala > 0 ? volumenGalones / escala : 0;
 
-      const itemActivo: unknown[] = await m.query(
-        `SELECT id_item_general FROM item_general WHERE id_item_general = ? AND deleted_at IS NULL LIMIT 1`,
-        [itemId],
+      await this.validarItemActivo(m, itemId);
+      const formulacion = await this.resolverFormulacionActiva(m, itemId);
+      const formulacionVersionId = await this.resolverVersionId(m, formulacion);
+      const ingredientes = await this.obtenerIngredientes(m, formulacion.id_formulaciones);
+
+      const { detalleMap, capasSeleccion } = this.parseDetalleYCapas(dto);
+      const factorVolumen = await this.calcularFactorVolumen(m, itemId, volumenGalones, detalleMap);
+      const totalCantidadBase = ingredientes.reduce((a, i) => a + Number(i.cantidad), 0);
+
+      const preparacionId = await this.insertarPreparacion(
+        m, dto, cantidadEnvases, itemId, formulacionVersionId, unidadId,
       );
-      if (!itemActivo.length) {
-        throw new BadRequestException(
-          'El item a producir no existe o fue archivado.',
-        );
-      }
-
-      const formRows: { id_formulaciones: number; version_actual: number }[] =
-        await m.query(
-          `SELECT f.id_formulaciones, f.version_actual FROM formulaciones f
-             INNER JOIN item_general ig ON ig.id_item_general = f.item_general_id
-            WHERE f.item_general_id = ? AND f.estado = 1 AND ig.deleted_at IS NULL LIMIT 1`,
-          [itemId],
-        );
-      if (!formRows.length) {
-        throw new BadRequestException('El item no tiene una formulación activa.');
-      }
-      const formulacion = formRows[0];
-
-      let formulacionVersionId: number | null = null;
-      if (formulacion.version_actual) {
-        const verRows: { id: number }[] = await m.query(
-          `SELECT id FROM formulaciones_versiones WHERE formulacion_id = ? AND version_num = ?`,
-          [formulacion.id_formulaciones, formulacion.version_actual],
-        );
-        formulacionVersionId = verRows.length ? Number(verRows[0].id) : null;
-      }
-
-      const ingredientes: { item_general_id: number; cantidad: string }[] =
-        await m.query(
-          `SELECT igf.item_general_id, igf.cantidad
-             FROM item_general_formulaciones igf
-             INNER JOIN item_general ig ON ig.id_item_general = igf.item_general_id
-            WHERE igf.formulaciones_id = ? AND ig.deleted_at IS NULL`,
-          [formulacion.id_formulaciones],
-        );
-      if (!ingredientes.length) {
-        throw new BadRequestException(
-          'La formulación no tiene ingredientes asignados (o fueron archivados).',
-        );
-      }
-
-      // detalleMap + capasSeleccion desde el body
-      const detalleMap = new Map<number, number>();
-      const capasSeleccion = new Map<number, CapaSel>();
-      for (const d of dto.detalle ?? []) {
-        const dId = Number(d.item_general_id);
-        if (dId) {
-          detalleMap.set(dId, Number(d.cantidad));
-          if (
-            d.modo_consumo !== undefined ||
-            d.capas !== undefined ||
-            d.bodega_id !== undefined ||
-            d.proveedor_id !== undefined
-          ) {
-            capasSeleccion.set(dId, {
-              modo: d.modo_consumo ?? 'FIFO',
-              capas: d.capas ?? [],
-              bodega_id: d.bodega_id != null ? Number(d.bodega_id) : null,
-              proveedor_id: d.proveedor_id != null ? Number(d.proveedor_id) : null,
-            });
-          }
-        }
-      }
-
-      // factorVolumen solo si NO hay detalle precalculado
-      let factorVolumen = 1;
-      if (detalleMap.size === 0) {
-        const ci: { volumen_base: string }[] = await m.query(
-          `SELECT COALESCE(NULLIF(volumen,0),1) AS volumen_base FROM costos_item WHERE item_general_id = ? LIMIT 1`,
-          [itemId],
-        );
-        const volumenBase = Number(ci[0]?.volumen_base ?? 1);
-        factorVolumen = volumenBase > 0 ? volumenGalones / volumenBase : 1;
-      }
-
-      const totalCantidadBase = ingredientes.reduce(
-        (a, i) => a + Number(i.cantidad),
-        0,
+      await this.insertarDetalleIngredientes(
+        m, preparacionId, ingredientes, detalleMap, factorVolumen, totalCantidadBase,
       );
-
-      const insPrep: { insertId: number } = await m.query(
-        `INSERT INTO preparaciones
-           (fecha_creacion, fecha_inicio, fecha_fin, cantidad, observaciones, estado, item_general_id, formulacion_version_id, unidad_id)
-         VALUES (NOW(), ?, ?, ?, ?, 0, ?, ?, ?)`,
-        [
-          dto.fecha_inicio ?? null,
-          dto.fecha_fin ?? null,
-          cantidadEnvases,
-          dto.observaciones ?? null,
-          itemId,
-          formulacionVersionId,
-          unidadId,
-        ],
-      );
-      const preparacionId = insPrep.insertId;
-
-      for (const ing of ingredientes) {
-        const ingId = Number(ing.item_general_id);
-        const cantidadEscalada = detalleMap.has(ingId)
-          ? this.r4(detalleMap.get(ingId) as number)
-          : this.r4(Number(ing.cantidad) * factorVolumen);
-        const porcentaje =
-          totalCantidadBase > 0
-            ? this.r4((Number(ing.cantidad) / totalCantidadBase) * 100)
-            : 0;
-        await m.query(
-          `INSERT INTO preparaciones_has_item_general
-             (preparaciones_id_preparaciones, item_general_id, cantidad, porcentajes)
-           VALUES (?, ?, ?, ?)`,
-          [preparacionId, ingId, cantidadEscalada, porcentaje],
-        );
-      }
-
-      for (const ci of dto.costos_indirectos ?? []) {
-        const nombre = (ci.nombre ?? '').trim();
-        const categoria = (ci.categoria ?? 'otros').trim();
-        const valor = Number(ci.valor_aplicado ?? 0);
-        if (nombre && valor > 0) {
-          await m.query(
-            `INSERT INTO preparaciones_costos_indirectos
-               (preparaciones_id, costos_indirectos_id, valor_aplicado, nombre, categoria)
-             VALUES (?, NULL, ?, ?, ?)`,
-            [preparacionId, valor, nombre, categoria],
-          );
-        }
-      }
+      await this.insertarCostosIndirectos(m, preparacionId, dto.costos_indirectos ?? []);
 
       await this.ajustarInventario(m, preparacionId, -1, responsable, capasSeleccion);
       return preparacionId;
@@ -274,23 +348,18 @@ export class PreparacionesService {
     return this.getById(prepId);
   }
 
-  // ── _ajustarInventarioPorPreparacion ──
-  private async ajustarInventario(
+  /**
+   * Ingredientes de la preparación + su costo_unitario vigente. LEFT JOIN a la
+   * ÚLTIMA fila de costos_item (MAX id) por ítem: si un ingrediente tuviera >1
+   * fila en costos_item, un JOIN directo lo devolvería duplicado y el loop de
+   * consumo descontaría el stock 2×. Mismo patrón defensivo que usan
+   * getById/costosResumen en este mismo service.
+   */
+  private async fetchIngredientesConCosto(
     m: EntityManager,
     prepId: number,
-    multiplicador: number,
-    responsable: string | null,
-    capasSeleccion: Map<number, CapaSel>,
-  ): Promise<void> {
-    const ingredientes: {
-      item_general_id: number;
-      cantidad: string;
-      costo_unitario: string;
-    }[] = await m.query(
-      // LEFT JOIN a la ÚLTIMA fila de costos_item (MAX id) por ítem: si un
-      // ingrediente tuviera >1 fila en costos_item, un JOIN directo lo devolvería
-      // duplicado y el loop de consumo descontaría el stock 2×. Mismo patrón
-      // defensivo que usan getById/costosResumen en este mismo service.
+  ): Promise<{ item_general_id: number; cantidad: string; costo_unitario: string }[]> {
+    return m.query(
       `SELECT phig.item_general_id, phig.cantidad, COALESCE(ci.costo_unitario, 0) AS costo_unitario
          FROM preparaciones_has_item_general phig
          LEFT JOIN costos_item ci
@@ -301,6 +370,132 @@ export class PreparacionesService {
         WHERE phig.preparaciones_id_preparaciones = ?`,
       [prepId],
     );
+  }
+
+  /**
+   * Resuelve QUÉ capas consumir para un ingrediente al descontar stock
+   * (MANUAL explícito → proveedor específico → FIFO por defecto). Lanza si la
+   * selección no cubre la cantidad requerida.
+   */
+  private async resolverConsumoCapas(
+    m: EntityManager,
+    itemId: number,
+    cantidadAbs: number,
+    seleccion: CapaSel | null,
+  ): Promise<Consumo[]> {
+    if (seleccion && seleccion.modo === 'MANUAL' && seleccion.capas.length) {
+      const consumosCapas = await this.capas.consumirCapasManual(m, seleccion.capas, itemId);
+      const consumido = consumosCapas.reduce((a, c) => a + c.cantidad_consumida, 0);
+      if (Math.abs(consumido - cantidadAbs) > 0.0001) {
+        throw new BadRequestException(
+          `La selección manual de capas para el ingrediente #${itemId} no cubre la cantidad requerida. Seleccionado: ${consumido} kg, Requerido: ${cantidadAbs} kg`,
+        );
+      }
+      return consumosCapas;
+    }
+    const seleccionProveedorId = seleccion?.proveedor_id ?? null;
+    if (seleccionProveedorId) {
+      const consumosCapas = await this.capas.consumirCapasPorProveedor(
+        m,
+        itemId,
+        cantidadAbs,
+        seleccionProveedorId,
+        seleccion?.bodega_id ?? null,
+      );
+      const consumido = consumosCapas.reduce((a, c) => a + c.cantidad_consumida, 0);
+      if (consumido < cantidadAbs - 0.001) {
+        throw new BadRequestException(
+          `Stock insuficiente del proveedor #${seleccionProveedorId} para el ingrediente #${itemId}. Disponible: ${consumido} kg, Requerido: ${cantidadAbs} kg`,
+        );
+      }
+      return consumosCapas;
+    }
+    return this.capas.consumirCapasFIFO(m, itemId, cantidadAbs, seleccion?.bodega_id ?? null);
+  }
+
+  /** UPSERT sobre el inventario legacy (tabla `inventario`, no capas). */
+  private async upsertInventarioLegacy(
+    m: EntityManager,
+    itemId: number,
+    diff: number,
+  ): Promise<{ bodegaId: number; saldoAnterior: number; saldoNuevo: number }> {
+    const stockRows: {
+      id_inventario: number;
+      cantidad: string;
+      bodegas_id: number;
+    }[] = await m.query(
+      `SELECT id_inventario, cantidad, bodegas_id FROM inventario WHERE item_general_id = ? ORDER BY cantidad DESC LIMIT 1`,
+      [itemId],
+    );
+    const stock = stockRows[0];
+    const bodegaId = stock ? Number(stock.bodegas_id) : 1;
+    const saldoAnterior = stock ? Number(stock.cantidad) : 0;
+    const saldoNuevo = saldoAnterior + diff;
+    if (!stock) {
+      await m.query(
+        `INSERT INTO inventario (item_general_id, bodegas_id, cantidad, estado, tipo, fecha_update) VALUES (?, ?, ?, 1, 1, NOW())`,
+        [itemId, bodegaId, diff],
+      );
+    } else {
+      await m.query(
+        `UPDATE inventario SET cantidad = cantidad + ?, fecha_update = NOW() WHERE id_inventario = ?`,
+        [diff, stock.id_inventario],
+      );
+    }
+    return { bodegaId, saldoAnterior, saldoNuevo };
+  }
+
+  /** Lote de proveedor a "congelar" en produccion_insumos_detalle, solo si es único entre las capas consumidas. */
+  private async resolverLoteSnapshot(
+    m: EntityManager,
+    consumosCapas: Consumo[],
+  ): Promise<string | null> {
+    const capaIds = consumosCapas.map((c) => c.capa_id).filter(Boolean);
+    if (!capaIds.length) return null;
+    const lotes: { lote_proveedor: string }[] = await m.query(
+      `SELECT DISTINCT lote_proveedor FROM inventario_capas WHERE id_capa IN (${capaIds.map(() => '?').join(',')}) AND lote_proveedor IS NOT NULL`,
+      capaIds,
+    );
+    return lotes.length === 1 ? lotes[0].lote_proveedor : null;
+  }
+
+  /** INSERT en produccion_insumos_detalle — costo congelado al momento del consumo. */
+  private async registrarCostoCongelado(
+    m: EntityManager,
+    prepId: number,
+    itemId: number,
+    seleccionProveedorId: number | null,
+    loteSnapshot: string | null,
+    bodegaId: number,
+    cantidadAbs: number,
+    costoUnitario: number,
+  ): Promise<void> {
+    await m.query(
+      `INSERT INTO produccion_insumos_detalle
+         (preparacion_id, item_general_id, proveedor_id, lote_proveedor, bodega_id, cantidad, costo_unitario, subtotal, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+      [
+        prepId,
+        itemId,
+        seleccionProveedorId,
+        loteSnapshot,
+        bodegaId,
+        cantidadAbs,
+        costoUnitario,
+        this.r4(cantidadAbs * costoUnitario),
+      ],
+    );
+  }
+
+  // ── _ajustarInventarioPorPreparacion ──
+  private async ajustarInventario(
+    m: EntityManager,
+    prepId: number,
+    multiplicador: number,
+    responsable: string | null,
+    capasSeleccion: Map<number, CapaSel>,
+  ): Promise<void> {
+    const ingredientes = await this.fetchIngredientesConCosto(m, prepId);
 
     if (multiplicador > 0) {
       await this.capas.restaurarCapas(m, prepId);
@@ -322,50 +517,7 @@ export class PreparacionesService {
 
       let consumosCapas: Consumo[] = [];
       if (multiplicador < 0 && (await this.capas.tieneCapas(m, itemId))) {
-        if (
-          seleccion &&
-          seleccion.modo === 'MANUAL' &&
-          seleccion.capas.length
-        ) {
-          consumosCapas = await this.capas.consumirCapasManual(
-            m,
-            seleccion.capas,
-            itemId,
-          );
-          const consumido = consumosCapas.reduce(
-            (a, c) => a + c.cantidad_consumida,
-            0,
-          );
-          if (Math.abs(consumido - cantidadAbs) > 0.0001) {
-            throw new BadRequestException(
-              `La selección manual de capas para el ingrediente #${itemId} no cubre la cantidad requerida. Seleccionado: ${consumido} kg, Requerido: ${cantidadAbs} kg`,
-            );
-          }
-        } else if (seleccionProveedorId) {
-          consumosCapas = await this.capas.consumirCapasPorProveedor(
-            m,
-            itemId,
-            cantidadAbs,
-            seleccionProveedorId,
-            seleccion?.bodega_id ?? null,
-          );
-          const consumido = consumosCapas.reduce(
-            (a, c) => a + c.cantidad_consumida,
-            0,
-          );
-          if (consumido < cantidadAbs - 0.001) {
-            throw new BadRequestException(
-              `Stock insuficiente del proveedor #${seleccionProveedorId} para el ingrediente #${itemId}. Disponible: ${consumido} kg, Requerido: ${cantidadAbs} kg`,
-            );
-          }
-        } else {
-          consumosCapas = await this.capas.consumirCapasFIFO(
-            m,
-            itemId,
-            cantidadAbs,
-            seleccion?.bodega_id ?? null,
-          );
-        }
+        consumosCapas = await this.resolverConsumoCapas(m, itemId, cantidadAbs, seleccion);
 
         if (consumosCapas.length) {
           await this.capas.registrarConsumos(m, prepId, consumosCapas);
@@ -378,56 +530,13 @@ export class PreparacionesService {
         }
       }
 
-      // inventario legacy
-      const stockRows: {
-        id_inventario: number;
-        cantidad: string;
-        bodegas_id: number;
-      }[] = await m.query(
-        `SELECT id_inventario, cantidad, bodegas_id FROM inventario WHERE item_general_id = ? ORDER BY cantidad DESC LIMIT 1`,
-        [itemId],
-      );
-      const stock = stockRows[0];
-      const bodegaId = stock ? Number(stock.bodegas_id) : 1;
-      const saldoAnterior = stock ? Number(stock.cantidad) : 0;
-      const saldoNuevo = saldoAnterior + diff;
-      if (!stock) {
-        await m.query(
-          `INSERT INTO inventario (item_general_id, bodegas_id, cantidad, estado, tipo, fecha_update) VALUES (?, ?, ?, 1, 1, NOW())`,
-          [itemId, bodegaId, diff],
-        );
-      } else {
-        await m.query(
-          `UPDATE inventario SET cantidad = cantidad + ?, fecha_update = NOW() WHERE id_inventario = ?`,
-          [diff, stock.id_inventario],
-        );
-      }
+      const { bodegaId, saldoAnterior, saldoNuevo } = await this.upsertInventarioLegacy(m, itemId, diff);
 
       // costo congelado
       if (multiplicador < 0) {
-        let loteSnapshot: string | null = null;
-        const capaIds = consumosCapas.map((c) => c.capa_id).filter(Boolean);
-        if (capaIds.length) {
-          const lotes: { lote_proveedor: string }[] = await m.query(
-            `SELECT DISTINCT lote_proveedor FROM inventario_capas WHERE id_capa IN (${capaIds.map(() => '?').join(',')}) AND lote_proveedor IS NOT NULL`,
-            capaIds,
-          );
-          if (lotes.length === 1) loteSnapshot = lotes[0].lote_proveedor;
-        }
-        await m.query(
-          `INSERT INTO produccion_insumos_detalle
-             (preparacion_id, item_general_id, proveedor_id, lote_proveedor, bodega_id, cantidad, costo_unitario, subtotal, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
-          [
-            prepId,
-            itemId,
-            seleccionProveedorId,
-            loteSnapshot,
-            bodegaId,
-            cantidadAbs,
-            costoUnitario,
-            this.r4(cantidadAbs * costoUnitario),
-          ],
+        const loteSnapshot = await this.resolverLoteSnapshot(m, consumosCapas);
+        await this.registrarCostoCongelado(
+          m, prepId, itemId, seleccionProveedorId, loteSnapshot, bodegaId, cantidadAbs, costoUnitario,
         );
       }
 

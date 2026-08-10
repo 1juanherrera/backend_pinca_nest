@@ -14,12 +14,20 @@ const upperTrim = (s: unknown) => String(s ?? '').trim().toUpperCase();
 /** limpiarNombreProveedor: uppercase(trim(quita paréntesis final)). */
 const limpiarNombre = (nombre: unknown) =>
   String(nombre ?? '').replace(/\s*\([^)]*\)\s*$/, '').trim().toUpperCase();
-/** matchNombre: exacto→1, substring cualquier dirección→2, else 0. */
+/**
+ * matchNombre: exacto→1, substring cualquier dirección→2 (con guarda de longitud
+ * shorter/longer >= 0.4 para evitar falsos positivos tipo "ACRONAL" calzando dentro
+ * de "COLARCRYL ACRONAL 50" — un producto distinto que solo contiene la palabra),
+ * else 0. Idéntica a formulaciones-costos.service.ts::matchNombre — misma fuente
+ * de verdad que usa la pantalla de Formulaciones.
+ */
 const matchNombre = (mpNombre: unknown, ipNombre: unknown): number => {
   const mp = upperTrim(mpNombre);
   const ip = limpiarNombre(ipNombre);
   if (mp === ip) return 1;
-  if (ip.includes(mp) || mp.includes(ip)) return 2;
+  const shorter = Math.min(mp.length, ip.length);
+  const longer = Math.max(mp.length, ip.length);
+  if ((ip.includes(mp) || mp.includes(ip)) && shorter / longer >= 0.4) return 2;
   return 0;
 };
 
@@ -100,10 +108,9 @@ export class CostosProduccionService {
     }
   }
 
-  // ── GET /costos-produccion ──
-  async getCostosProduccionBatch(): Promise<unknown> {
-    const margenDef = await this.margenDefault();
-    const productos: Record<string, unknown>[] = await this.dataSource.query(
+  /** Productos con fórmula activa (tipo=0, no borrado) + agregados de costos_item. */
+  private async fetchProductosConFormula(margenDef: number): Promise<Record<string, unknown>[]> {
+    return this.dataSource.query(
       `SELECT ig.id_item_general, ig.nombre, ig.codigo, ig.precio_venta_manual, ig.precio_manual_activo,
               cat.nombre AS categoria_nombre, f.id_formulaciones,
               COALESCE(NULLIF(ci.volumen,0),1) AS volumen_base,
@@ -117,11 +124,12 @@ export class CostosProduccionService {
          LEFT JOIN categoria cat  ON cat.id_categoria    = ig.categoria_id
         WHERE ig.tipo = 0 AND ig.deleted_at IS NULL ORDER BY ig.nombre ASC`,
     );
-    if (!productos.length) return [];
+  }
 
-    const formIds = productos.map((p) => N(p.id_formulaciones));
+  /** Ingredientes (item_general_formulaciones) de todas las fórmulas dadas, en una sola query. */
+  private async fetchIngredientesPorFormulas(formIds: number[]): Promise<Record<string, unknown>[]> {
     const phF = formIds.map(() => '?').join(',');
-    const ingredientes: Record<string, unknown>[] = await this.dataSource.query(
+    return this.dataSource.query(
       `SELECT igf.formulaciones_id, igf.item_general_id AS mp_id, igf.cantidad, igf.porcentaje,
               ig.nombre AS mp_nombre, ig.codigo AS mp_codigo, ig.deleted_at AS mp_deleted
          FROM item_general_formulaciones igf
@@ -129,57 +137,187 @@ export class CostosProduccionService {
         WHERE igf.formulaciones_id IN (${phF}) ORDER BY igf.formulaciones_id, ig.nombre`,
       formIds,
     );
+  }
+
+  /** Stock disponible (Σ inventario_capas activas) por materia prima. */
+  private async fetchStockPorMp(mpIds: number[]): Promise<Map<number, number>> {
+    const stockPorMp = new Map<number, number>();
+    if (!mpIds.length) return stockPorMp;
+    const ph = mpIds.map(() => '?').join(',');
+    const rows: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT item_general_id, COALESCE(SUM(cantidad_disponible),0) AS stock_kg
+         FROM inventario_capas WHERE estado = 1 AND item_general_id IN (${ph}) GROUP BY item_general_id`,
+      mpIds,
+    );
+    for (const r of rows) stockPorMp.set(N(r.item_general_id), N(r.stock_kg));
+    return stockPorMp;
+  }
+
+  /**
+   * Proveedores disponibles por materia prima (match por link directo o por nombre
+   * exacto/substring — ver `matchNombre`), ordenados por precio/kg asc (el más barato
+   * gana, esté o no vinculado directamente — mismo criterio que
+   * formulaciones-costos.service.ts::getOpcionesProveedorFormulacion, la fuente de
+   * verdad que usa la pantalla de Formulaciones). precio_por_kg usa precio_con_iva
+   * (fallback a precio_unitario si no hay IVA cargado) — el costo real de compra.
+   */
+  private async fetchProveedoresPorMp(
+    mpIds: number[],
+    mpsPorId: Map<number, { nombre: unknown; codigo: unknown }>,
+  ): Promise<Map<number, Record<string, unknown>[]>> {
+    const proveedoresPorMp = new Map<number, Record<string, unknown>[]>();
+    if (!mpIds.length) return proveedoresPorMp;
+    const ph = mpIds.map(() => '?').join(',');
+    const rows: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT ip.item_general_id, ip.id_item_proveedor, ip.nombre AS ip_nombre, ip.precio_unitario, ip.precio_con_iva,
+              ip.factor_conversion, ip.proveedor_id, p.nombre_empresa
+         FROM item_proveedor ip
+         INNER JOIN proveedor p ON p.id_proveedor = ip.proveedor_id
+        WHERE ip.disponible = 1 AND ip.deleted_at IS NULL AND p.deleted_at IS NULL
+          AND (ip.item_general_id IN (${ph}) OR ip.item_general_id IS NULL)`,
+      mpIds,
+    );
+    for (const r of rows) {
+      const factor = Math.max(Number(r.factor_conversion) || 1, 0.001);
+      const precioIva = N(r.precio_con_iva) || N(r.precio_unitario);
+      r.precio_por_kg = round(precioIva / factor, 4);
+      const ipItemId = r.item_general_id !== null && r.item_general_id !== undefined ? N(r.item_general_id) : null;
+      if (ipItemId !== null && mpsPorId.has(ipItemId)) {
+        r.match_tipo = 1;
+        if (!proveedoresPorMp.has(ipItemId)) proveedoresPorMp.set(ipItemId, []);
+        proveedoresPorMp.get(ipItemId)!.push(r);
+        continue;
+      }
+      for (const [mpId, mp] of mpsPorId) {
+        const score = matchNombre(mp.nombre, r.ip_nombre);
+        if (score > 0) {
+          const rr = { ...r, match_tipo: score + 1 };
+          if (!proveedoresPorMp.has(mpId)) proveedoresPorMp.set(mpId, []);
+          proveedoresPorMp.get(mpId)!.push(rr);
+        }
+      }
+    }
+    for (const opts of proveedoresPorMp.values()) {
+      opts.sort((a, b) => N(a.precio_por_kg) - N(b.precio_por_kg));
+    }
+    return proveedoresPorMp;
+  }
+
+  /**
+   * Costo/estado/cuello de botella de UN producto a partir de sus ingredientes,
+   * el stock disponible y los proveedores ya resueltos por MP.
+   */
+  private async calcularCostoProducto(
+    p: Record<string, unknown>,
+    mps: Record<string, unknown>[],
+    stockPorMp: Map<number, number>,
+    proveedoresPorMp: Map<number, Record<string, unknown>[]>,
+  ): Promise<Record<string, unknown>> {
+    const faltantes: Record<string, unknown>[] = [];
+    const proveedoresUsados = new Map<number, Record<string, unknown>>();
+    let costoMpTotal = 0;
+    let tandasMin = Infinity;
+    let cuello: Record<string, unknown> | null = null;
+
+    for (const mp of mps) {
+      const mpId = N(mp.mp_id);
+      const cantidad = N(mp.cantidad);
+      if (cantidad > 0) {
+        const stockMp = stockPorMp.get(mpId) ?? 0;
+        const tandasMp = stockMp / cantidad;
+        if (tandasMp < tandasMin) {
+          tandasMin = tandasMp;
+          cuello = {
+            mp_id: mpId, nombre: mp.mp_nombre, codigo: mp.mp_codigo,
+            stock_kg: round(stockMp, 4), requerido_por_tanda_kg: round(cantidad, 4), tandas: round(tandasMp, 3),
+          };
+        }
+      }
+      const esAgua = upperTrim(mp.mp_nombre) === 'AGUA';
+      const opciones = proveedoresPorMp.get(mpId) ?? [];
+      if (mp.mp_deleted || (!opciones.length && !esAgua)) {
+        faltantes.push({ id: mpId, nombre: mp.mp_nombre, codigo: mp.mp_codigo, motivo: mp.mp_deleted ? 'archivado' : 'sin_proveedor' });
+        continue;
+      }
+      if (esAgua && !opciones.length) {
+        const cu = N((await this.dataSource.query(`SELECT COALESCE(costo_unitario,0) AS cu FROM costos_item WHERE item_general_id = ?`, [mpId]))[0]?.cu);
+        costoMpTotal += cantidad * cu;
+        continue;
+      }
+      const opcion = opciones[0];
+      costoMpTotal += cantidad * N(opcion.precio_por_kg);
+      const pid = N(opcion.proveedor_id);
+      if (!proveedoresUsados.has(pid)) {
+        proveedoresUsados.set(pid, { id_proveedor: pid, nombre_empresa: opcion.nombre_empresa, items: 0 });
+      }
+      (proveedoresUsados.get(pid)!.items as number)++;
+    }
+
+    const estado = faltantes.length ? 'incompleto' : 'completo';
+    const vol = N(p.volumen_base);
+    const empaqueMod = N(p.envase) + N(p.etiqueta) + N(p.bandeja) + N(p.plastico) + N(p.costo_mod);
+    const costoMpPorUnidad = vol > 0 ? costoMpTotal / vol : costoMpTotal;
+    const costoTotal = estado === 'completo' ? costoMpPorUnidad + empaqueMod : null;
+    const margen = N(p.porcentaje_utilidad);
+    const precioVentaCalc =
+      costoTotal !== null && margen > 0 ? round(costoTotal * (1 + margen / 100), 2)
+        : costoTotal !== null ? round(costoTotal, 2) : null;
+    const tandasPosibles = tandasMin === Infinity ? 0 : Math.floor(tandasMin);
+    const galonesPosibles = tandasPosibles * vol;
+
+    return {
+      id_item_general: N(p.id_item_general), nombre: p.nombre, codigo: p.codigo,
+      categoria_nombre: p.categoria_nombre, volumen_base: vol, estado,
+      mps_total: mps.length, mps_faltantes: faltantes,
+      tandas_posibles: tandasPosibles, galones_posibles: galonesPosibles, cuello_botella: cuello,
+      costo_mp_total: estado === 'completo' ? round(costoMpTotal, 2) : null,
+      costo_mp_por_unidad: estado === 'completo' ? round(costoMpPorUnidad, 2) : null,
+      costo_empaque_mod: round(empaqueMod, 2),
+      empaque_mod_detalle: {
+        envase: round(N(p.envase), 2), etiqueta: round(N(p.etiqueta), 2), bandeja: round(N(p.bandeja), 2),
+        plastico: round(N(p.plastico), 2), costo_mod: round(N(p.costo_mod), 2),
+      },
+      costo_total: costoTotal !== null ? round(costoTotal, 2) : null,
+      porcentaje_utilidad: margen, precio_venta_calc: precioVentaCalc,
+      precio_venta_manual: fNull(p.precio_venta_manual),
+      precio_manual_activo: N(p.precio_manual_activo),
+      proveedores_usados: [...proveedoresUsados.values()],
+    };
+  }
+
+  /** % de materias primas con al menos un proveedor disponible (o AGUA, que no lo necesita). */
+  private calcularCobertura(
+    mpIds: number[],
+    mpsPorId: Map<number, { nombre: unknown; codigo: unknown }>,
+    proveedoresPorMp: Map<number, Record<string, unknown>[]>,
+  ): Record<string, unknown> {
+    const totalMps = mpIds.length;
+    let cubiertasMps = 0;
+    for (const mid of mpIds) {
+      const esAgua = upperTrim(mpsPorId.get(mid)?.nombre) === 'AGUA';
+      if ((proveedoresPorMp.get(mid)?.length ?? 0) > 0 || esAgua) cubiertasMps++;
+    }
+    return {
+      mps_totales: totalMps, mps_cubiertas: cubiertasMps, mps_sin_proveedor: totalMps - cubiertasMps,
+      pct: totalMps > 0 ? round((cubiertasMps / totalMps) * 100, 1) : 0,
+    };
+  }
+
+  // ── GET /costos-produccion ──
+  async getCostosProduccionBatch(): Promise<unknown> {
+    const margenDef = await this.margenDefault();
+    const productos = await this.fetchProductosConFormula(margenDef);
+    if (!productos.length) return [];
+
+    const formIds = productos.map((p) => N(p.id_formulaciones));
+    const ingredientes = await this.fetchIngredientesPorFormulas(formIds);
 
     const mpIds = [...new Set(ingredientes.map((i) => N(i.mp_id)))];
     const mpsPorId = new Map<number, { nombre: unknown; codigo: unknown }>();
     for (const i of ingredientes) mpsPorId.set(N(i.mp_id), { nombre: i.mp_nombre, codigo: i.mp_codigo });
 
-    const stockPorMp = new Map<number, number>();
-    if (mpIds.length) {
-      const ph = mpIds.map(() => '?').join(',');
-      const rows: Record<string, unknown>[] = await this.dataSource.query(
-        `SELECT item_general_id, COALESCE(SUM(cantidad_disponible),0) AS stock_kg
-           FROM inventario_capas WHERE estado = 1 AND item_general_id IN (${ph}) GROUP BY item_general_id`,
-        mpIds,
-      );
-      for (const r of rows) stockPorMp.set(N(r.item_general_id), N(r.stock_kg));
-    }
-
-    const proveedoresPorMp = new Map<number, Record<string, unknown>[]>();
-    if (mpIds.length) {
-      const ph = mpIds.map(() => '?').join(',');
-      const rows: Record<string, unknown>[] = await this.dataSource.query(
-        `SELECT ip.item_general_id, ip.id_item_proveedor, ip.nombre AS ip_nombre, ip.precio_unitario,
-                ip.factor_conversion, ip.proveedor_id, p.nombre_empresa
-           FROM item_proveedor ip
-           INNER JOIN proveedor p ON p.id_proveedor = ip.proveedor_id
-          WHERE ip.disponible = 1 AND ip.deleted_at IS NULL AND p.deleted_at IS NULL
-            AND (ip.item_general_id IN (${ph}) OR ip.item_general_id IS NULL)`,
-        mpIds,
-      );
-      for (const r of rows) {
-        const factor = Math.max(Number(r.factor_conversion) || 1, 0.001);
-        r.precio_por_kg = round(N(r.precio_unitario) / factor, 4);
-        const ipItemId = r.item_general_id !== null && r.item_general_id !== undefined ? N(r.item_general_id) : null;
-        if (ipItemId !== null && mpsPorId.has(ipItemId)) {
-          r.match_tipo = 1;
-          if (!proveedoresPorMp.has(ipItemId)) proveedoresPorMp.set(ipItemId, []);
-          proveedoresPorMp.get(ipItemId)!.push(r);
-          continue;
-        }
-        for (const [mpId, mp] of mpsPorId) {
-          const score = matchNombre(mp.nombre, r.ip_nombre);
-          if (score > 0) {
-            const rr = { ...r, match_tipo: score + 1 };
-            if (!proveedoresPorMp.has(mpId)) proveedoresPorMp.set(mpId, []);
-            proveedoresPorMp.get(mpId)!.push(rr);
-          }
-        }
-      }
-      for (const opts of proveedoresPorMp.values()) {
-        opts.sort((a, b) => (N(a.match_tipo) - N(b.match_tipo)) || (N(a.precio_por_kg) - N(b.precio_por_kg)));
-      }
-    }
+    const stockPorMp = await this.fetchStockPorMp(mpIds);
+    const proveedoresPorMp = await this.fetchProveedoresPorMp(mpIds, mpsPorId);
 
     const ingredientesPorForm = new Map<number, Record<string, unknown>[]>();
     for (const i of ingredientes) {
@@ -192,90 +330,12 @@ export class CostosProduccionService {
     for (const p of productos) {
       const formId = N(p.id_formulaciones);
       const mps = ingredientesPorForm.get(formId) ?? [];
-      const faltantes: Record<string, unknown>[] = [];
-      const proveedoresUsados = new Map<number, Record<string, unknown>>();
-      let costoMpTotal = 0;
-      let tandasMin = Infinity;
-      let cuello: Record<string, unknown> | null = null;
-
-      for (const mp of mps) {
-        const mpId = N(mp.mp_id);
-        const cantidad = N(mp.cantidad);
-        if (cantidad > 0) {
-          const stockMp = stockPorMp.get(mpId) ?? 0;
-          const tandasMp = stockMp / cantidad;
-          if (tandasMp < tandasMin) {
-            tandasMin = tandasMp;
-            cuello = {
-              mp_id: mpId, nombre: mp.mp_nombre, codigo: mp.mp_codigo,
-              stock_kg: round(stockMp, 4), requerido_por_tanda_kg: round(cantidad, 4), tandas: round(tandasMp, 3),
-            };
-          }
-        }
-        const esAgua = upperTrim(mp.mp_nombre) === 'AGUA';
-        const opciones = proveedoresPorMp.get(mpId) ?? [];
-        if (mp.mp_deleted || (!opciones.length && !esAgua)) {
-          faltantes.push({ id: mpId, nombre: mp.mp_nombre, codigo: mp.mp_codigo, motivo: mp.mp_deleted ? 'archivado' : 'sin_proveedor' });
-          continue;
-        }
-        if (esAgua && !opciones.length) {
-          const cu = N((await this.dataSource.query(`SELECT COALESCE(costo_unitario,0) AS cu FROM costos_item WHERE item_general_id = ?`, [mpId]))[0]?.cu);
-          costoMpTotal += cantidad * cu;
-          continue;
-        }
-        const opcion = opciones[0];
-        costoMpTotal += cantidad * N(opcion.precio_por_kg);
-        const pid = N(opcion.proveedor_id);
-        if (!proveedoresUsados.has(pid)) {
-          proveedoresUsados.set(pid, { id_proveedor: pid, nombre_empresa: opcion.nombre_empresa, items: 0 });
-        }
-        (proveedoresUsados.get(pid)!.items as number)++;
-      }
-
-      const estado = faltantes.length ? 'incompleto' : 'completo';
-      const vol = N(p.volumen_base);
-      const empaqueMod = N(p.envase) + N(p.etiqueta) + N(p.bandeja) + N(p.plastico) + N(p.costo_mod);
-      const costoMpPorUnidad = vol > 0 ? costoMpTotal / vol : costoMpTotal;
-      const costoTotal = estado === 'completo' ? costoMpPorUnidad + empaqueMod : null;
-      const margen = N(p.porcentaje_utilidad);
-      const precioVentaCalc =
-        costoTotal !== null && margen > 0 ? round(costoTotal * (1 + margen / 100), 2)
-          : costoTotal !== null ? round(costoTotal, 2) : null;
-      const tandasPosibles = tandasMin === Infinity ? 0 : Math.floor(tandasMin);
-      const galonesPosibles = tandasPosibles * vol;
-
-      resultado.push({
-        id_item_general: N(p.id_item_general), nombre: p.nombre, codigo: p.codigo,
-        categoria_nombre: p.categoria_nombre, volumen_base: vol, estado,
-        mps_total: mps.length, mps_faltantes: faltantes,
-        tandas_posibles: tandasPosibles, galones_posibles: galonesPosibles, cuello_botella: cuello,
-        costo_mp_total: estado === 'completo' ? round(costoMpTotal, 2) : null,
-        costo_mp_por_unidad: estado === 'completo' ? round(costoMpPorUnidad, 2) : null,
-        costo_empaque_mod: round(empaqueMod, 2),
-        empaque_mod_detalle: {
-          envase: round(N(p.envase), 2), etiqueta: round(N(p.etiqueta), 2), bandeja: round(N(p.bandeja), 2),
-          plastico: round(N(p.plastico), 2), costo_mod: round(N(p.costo_mod), 2),
-        },
-        costo_total: costoTotal !== null ? round(costoTotal, 2) : null,
-        porcentaje_utilidad: margen, precio_venta_calc: precioVentaCalc,
-        precio_venta_manual: fNull(p.precio_venta_manual),
-        precio_manual_activo: N(p.precio_manual_activo),
-        proveedores_usados: [...proveedoresUsados.values()],
-      });
+      resultado.push(await this.calcularCostoProducto(p, mps, stockPorMp, proveedoresPorMp));
     }
 
-    const totalMps = mpIds.length;
-    let cubiertasMps = 0;
-    for (const mid of mpIds) {
-      const esAgua = upperTrim(mpsPorId.get(mid)?.nombre) === 'AGUA';
-      if ((proveedoresPorMp.get(mid)?.length ?? 0) > 0 || esAgua) cubiertasMps++;
-    }
     return {
       productos: resultado,
-      cobertura: {
-        mps_totales: totalMps, mps_cubiertas: cubiertasMps, mps_sin_proveedor: totalMps - cubiertasMps,
-        pct: totalMps > 0 ? round((cubiertasMps / totalMps) * 100, 1) : 0,
-      },
+      cobertura: this.calcularCobertura(mpIds, mpsPorId, proveedoresPorMp),
     };
   }
 
@@ -308,7 +368,7 @@ export class CostosProduccionService {
     if (mpIds.length) {
       const ph = mpIds.map(() => '?').join(',');
       const rows: Record<string, unknown>[] = await this.dataSource.query(
-        `SELECT ip.item_general_id, ip.id_item_proveedor, ip.precio_unitario, ip.factor_conversion,
+        `SELECT ip.item_general_id, ip.id_item_proveedor, ip.precio_unitario, ip.precio_con_iva, ip.factor_conversion,
                 ip.proveedor_id, ip.nombre AS item_proveedor_nombre, p.nombre_empresa, uc.nombre AS unidad_compra
            FROM item_proveedor ip
            INNER JOIN proveedor p ON p.id_proveedor = ip.proveedor_id
@@ -319,7 +379,8 @@ export class CostosProduccionService {
       );
       for (const r of rows) {
         const factor = Math.max(Number(r.factor_conversion) || 1, 0.001);
-        r.precio_por_kg = round(N(r.precio_unitario) / factor, 4);
+        const precioIva = N(r.precio_con_iva) || N(r.precio_unitario);
+        r.precio_por_kg = round(precioIva / factor, 4);
         const ipItemId = r.item_general_id !== null && r.item_general_id !== undefined ? N(r.item_general_id) : null;
         if (ipItemId !== null && mpsPorId.has(ipItemId)) {
           r.match_tipo = 1;
@@ -337,7 +398,7 @@ export class CostosProduccionService {
         }
       }
       for (const opts of proveedoresPorMp.values()) {
-        opts.sort((a, b) => (N(a.match_tipo) - N(b.match_tipo)) || (N(a.precio_por_kg) - N(b.precio_por_kg)));
+        opts.sort((a, b) => N(a.precio_por_kg) - N(b.precio_por_kg));
       }
     }
 
