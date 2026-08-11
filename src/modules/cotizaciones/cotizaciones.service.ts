@@ -288,105 +288,153 @@ export class CotizacionesService {
     }
   }
 
+  private async lockYValidarCotizacionConvertible(
+    m: import('typeorm').EntityManager,
+    id: number,
+  ): Promise<{
+    estado: string;
+    cliente_id: number;
+    numero: string;
+    subtotal: number;
+    descuento: number;
+    impuestos: number;
+    retencion: number;
+    total: number;
+  }> {
+    // Lock pesimista sobre la cotización DENTRO de la transacción: evita que
+    // dos requests concurrentes (o un doble-click) generen DOS facturas reales
+    // desde la misma cotización (doble folio DIAN, doble cuenta por cobrar).
+    const locked: Array<{
+      estado: string;
+      cliente_id: number;
+      numero: string;
+      subtotal: number;
+      descuento: number;
+      impuestos: number;
+      retencion: number;
+      total: number;
+    }> = await m.query(
+      `SELECT estado, cliente_id, numero, subtotal, descuento, impuestos, retencion, total
+         FROM cotizaciones
+        WHERE id_cotizaciones = ? AND deleted_at IS NULL
+        FOR UPDATE`,
+      [id],
+    );
+    if (!locked.length) {
+      throw new NotFoundException(`Cotización con ID ${id} no encontrada.`);
+    }
+    const cot = locked[0];
+    if (cot.estado === 'Convertida') {
+      throw new BadRequestException(
+        'Esta cotización ya fue convertida a factura',
+      );
+    }
+    if (!['Aceptada', 'Enviada'].includes(cot.estado)) {
+      throw new BadRequestException(
+        'Solo se pueden convertir cotizaciones en estado Aceptada o Enviada',
+      );
+    }
+    return cot;
+  }
+
+  private async validarClienteActivo(
+    m: import('typeorm').EntityManager,
+    clienteId: number,
+  ): Promise<void> {
+    const cli: { n: number }[] = await m.query(
+      `SELECT COUNT(*) AS n FROM clientes WHERE id_clientes = ? AND deleted_at IS NULL`,
+      [clienteId],
+    );
+    if (!Number(cli[0].n)) {
+      throw new BadRequestException(
+        'El cliente de la cotización fue eliminado. No se puede generar la factura.',
+      );
+    }
+  }
+
+  private async crearFacturaDesdeCotizacion(
+    m: import('typeorm').EntityManager,
+    cot: {
+      cliente_id: number; numero: string; subtotal: number; descuento: number;
+      impuestos: number; retencion: number; total: number;
+    },
+  ): Promise<{ facturaId: number; numeroFac: string }> {
+    const numeroFac = await this.numeracion.reservar('factura', m);
+    const dias = await this.configNum(m, 'dias_vencimiento_factura', 30);
+    const insFac: { insertId: number } = await m.query(
+      `INSERT INTO facturas
+         (numero, cliente_id, fecha_emision, fecha_vencimiento, subtotal, descuento,
+          impuestos, retencion, total, saldo_pendiente, estado, observaciones)
+       VALUES (?, ?, CURDATE(), DATE_ADD(CURDATE(), INTERVAL ? DAY), ?, ?, ?, ?, ?, ?, 'Pendiente', ?)`,
+      [
+        numeroFac,
+        cot.cliente_id,
+        dias,
+        cot.subtotal,
+        cot.descuento,
+        cot.impuestos,
+        cot.retencion,
+        cot.total,
+        cot.total,
+        `Generada desde cotización ${cot.numero}`,
+      ],
+    );
+    return { facturaId: insFac.insertId, numeroFac };
+  }
+
+  private async copiarDetalleCotizacionAFactura(
+    m: import('typeorm').EntityManager,
+    cotizacionId: number,
+    facturaId: number,
+  ): Promise<void> {
+    const items: Record<string, unknown>[] = await m.query(
+      `SELECT * FROM cotizaciones_detalle WHERE cotizaciones_id = ?`,
+      [cotizacionId],
+    );
+    for (const it of items) {
+      await m.query(
+        `INSERT INTO facturas_detalle (facturas_id, descripcion, cantidad, precio_unit, descuento_pct, subtotal)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          facturaId,
+          it.descripcion,
+          it.cantidad,
+          it.precio_unit,
+          it.descuento_pct ?? 0,
+          it.subtotal,
+        ],
+      );
+    }
+  }
+
+  private async marcarCotizacionConvertida(
+    m: import('typeorm').EntityManager,
+    id: number,
+    facturaId: number,
+  ): Promise<void> {
+    const upd: { affectedRows: number } = await m.query(
+      `UPDATE cotizaciones SET estado = 'Convertida', facturas_id = ?
+        WHERE id_cotizaciones = ? AND estado <> 'Convertida'`,
+      [facturaId, id],
+    );
+    if (!upd.affectedRows) {
+      // Defensa extra: si otra operación convirtió entre el lock y aquí,
+      // abortamos toda la transacción (no queda factura huérfana).
+      throw new BadRequestException(
+        'La cotización ya fue convertida por otra operación.',
+      );
+    }
+  }
+
   /** POST /cotizaciones/:id/convertir → crea factura desde la cotización. */
   async convertir(id: number): Promise<Record<string, unknown>> {
     return this.dataSource.transaction(async (m) => {
-      // Lock pesimista sobre la cotización DENTRO de la transacción: evita que
-      // dos requests concurrentes (o un doble-click) generen DOS facturas reales
-      // desde la misma cotización (doble folio DIAN, doble cuenta por cobrar).
-      const locked: Array<{
-        estado: string;
-        cliente_id: number;
-        numero: string;
-        subtotal: number;
-        descuento: number;
-        impuestos: number;
-        retencion: number;
-        total: number;
-      }> = await m.query(
-        `SELECT estado, cliente_id, numero, subtotal, descuento, impuestos, retencion, total
-           FROM cotizaciones
-          WHERE id_cotizaciones = ? AND deleted_at IS NULL
-          FOR UPDATE`,
-        [id],
-      );
-      if (!locked.length) {
-        throw new NotFoundException(`Cotización con ID ${id} no encontrada.`);
-      }
-      const cot = locked[0];
-      if (cot.estado === 'Convertida') {
-        throw new BadRequestException(
-          'Esta cotización ya fue convertida a factura',
-        );
-      }
-      if (!['Aceptada', 'Enviada'].includes(cot.estado)) {
-        throw new BadRequestException(
-          'Solo se pueden convertir cotizaciones en estado Aceptada o Enviada',
-        );
-      }
-      const cli: { n: number }[] = await m.query(
-        `SELECT COUNT(*) AS n FROM clientes WHERE id_clientes = ? AND deleted_at IS NULL`,
-        [cot.cliente_id],
-      );
-      if (!Number(cli[0].n)) {
-        throw new BadRequestException(
-          'El cliente de la cotización fue eliminado. No se puede generar la factura.',
-        );
-      }
+      const cot = await this.lockYValidarCotizacionConvertible(m, id);
+      await this.validarClienteActivo(m, cot.cliente_id);
 
-      const numeroFac = await this.numeracion.reservar('factura', m);
-      const dias = await this.configNum(m, 'dias_vencimiento_factura', 30);
-      const insFac: { insertId: number } = await m.query(
-        `INSERT INTO facturas
-           (numero, cliente_id, fecha_emision, fecha_vencimiento, subtotal, descuento,
-            impuestos, retencion, total, saldo_pendiente, estado, observaciones)
-         VALUES (?, ?, CURDATE(), DATE_ADD(CURDATE(), INTERVAL ? DAY), ?, ?, ?, ?, ?, ?, 'Pendiente', ?)`,
-        [
-          numeroFac,
-          cot.cliente_id,
-          dias,
-          cot.subtotal,
-          cot.descuento,
-          cot.impuestos,
-          cot.retencion,
-          cot.total,
-          cot.total,
-          `Generada desde cotización ${cot.numero}`,
-        ],
-      );
-      const facturaId = insFac.insertId;
-
-      const items: Record<string, unknown>[] = await m.query(
-        `SELECT * FROM cotizaciones_detalle WHERE cotizaciones_id = ?`,
-        [id],
-      );
-      for (const it of items) {
-        await m.query(
-          `INSERT INTO facturas_detalle (facturas_id, descripcion, cantidad, precio_unit, descuento_pct, subtotal)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [
-            facturaId,
-            it.descripcion,
-            it.cantidad,
-            it.precio_unit,
-            it.descuento_pct ?? 0,
-            it.subtotal,
-          ],
-        );
-      }
-
-      const upd: { affectedRows: number } = await m.query(
-        `UPDATE cotizaciones SET estado = 'Convertida', facturas_id = ?
-          WHERE id_cotizaciones = ? AND estado <> 'Convertida'`,
-        [facturaId, id],
-      );
-      if (!upd.affectedRows) {
-        // Defensa extra: si otra operación convirtió entre el lock y aquí,
-        // abortamos toda la transacción (no queda factura huérfana).
-        throw new BadRequestException(
-          'La cotización ya fue convertida por otra operación.',
-        );
-      }
+      const { facturaId, numeroFac } = await this.crearFacturaDesdeCotizacion(m, cot);
+      await this.copiarDetalleCotizacionAFactura(m, id, facturaId);
+      await this.marcarCotizacionConvertida(m, id, facturaId);
 
       const fac: Record<string, unknown>[] = await m.query(
         `SELECT * FROM facturas WHERE id_facturas = ?`,
