@@ -56,10 +56,7 @@ export class FormulacionesCostosService {
     return N(await this.cfg.obtener('margen_utilidad_default_pct', 50));
   }
 
-  // ── calculate_costs (GET formulaciones/costos/:id) ──
-  async calculateCosts(itemId: number, newVolume: number | null = null): Promise<Record<string, unknown>> {
-    if (!itemId) throw this.fail('Parámetro inválido: itemId requerido.');
-    const margenDef = await this.margenDefault();
+  private async fetchItemConCostosDetalle(itemId: number, margenDef: number): Promise<Record<string, unknown>> {
     const item = (await this.dataSource.query(
       `SELECT ig.id_item_general, ig.nombre, ig.codigo, ig.tipo, ig.precio_venta_manual, ig.precio_manual_activo,
               ig.viscosidad, ig.p_g, ig.color, ig.secado, ig.cubrimiento, ig.brillo_60, i.cantidad,
@@ -75,13 +72,22 @@ export class FormulacionesCostosService {
       [itemId],
     ))[0];
     if (!item) throw this.fail(`Item con ID ${itemId} no encontrado.`);
+    return item;
+  }
 
+  private async fetchFormulacionIdActivaDeItem(itemId: number, itemNombre: unknown): Promise<number> {
     const formRow = (await this.dataSource.query(
       `SELECT id_formulaciones FROM formulaciones WHERE item_general_id = ? AND estado = 1 LIMIT 1`,
-      [N(item.id_item_general)],
+      [itemId],
     ))[0];
-    if (!formRow) throw this.fail(`El item '${item.nombre}' no tiene una formulación activa vinculada.`);
+    if (!formRow) throw this.fail(`El item '${itemNombre}' no tiene una formulación activa vinculada.`);
+    return formRow.id_formulaciones;
+  }
 
+  private async fetchIngredientesConCostoTotal(
+    formulacionId: number,
+    itemNombre: unknown,
+  ): Promise<Record<string, unknown>[]> {
     const formulaciones: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT igf.id_item_general_formulaciones, igf.item_general_id, igf.formulaciones_id, igf.cantidad,
               igf.orden, igf.tipo, igf.texto, igf.nota, i.cantidad AS inventario_cantidad, ci.fecha_calculo,
@@ -97,18 +103,27 @@ export class FormulacionesCostosService {
          LEFT JOIN costos_item ci ON ig.id_item_general = ci.item_general_id
          LEFT JOIN inventario i ON ig.id_item_general = i.item_general_id
         WHERE igf.formulaciones_id = ? ORDER BY igf.orden ASC, igf.id_item_general_formulaciones ASC`,
-      [formRow.id_formulaciones],
+      [formulacionId],
     );
-    if (!formulaciones.length) throw this.fail(`La formulación del item ${item.nombre} no tiene materias primas asignadas.`);
+    if (!formulaciones.length) throw this.fail(`La formulación del item ${itemNombre} no tiene materias primas asignadas.`);
+    return formulaciones;
+  }
 
-    const volumenBase = N(item.volumen_base);
+  private calcularFactorVolumen(volumenBase: number, newVolume: number | null): { factorVolumen: number; usarNuevoVolumen: boolean } {
     let factorVolumen = 1;
     let usarNuevoVolumen = false;
     if (newVolume && !Number.isNaN(Number(newVolume)) && newVolume > 0 && volumenBase > 0) {
       factorVolumen = newVolume / volumenBase;
       usarNuevoVolumen = true;
     }
+    return { factorVolumen, usarNuevoVolumen };
+  }
 
+  private sumarTotalesMateriaPrima(
+    formulaciones: Record<string, unknown>[],
+    factorVolumen: number,
+    usarNuevoVolumen: boolean,
+  ): { totalMateriaPrima: number; totalCantidad: number } {
     let totalMateriaPrima = 0;
     let totalCantidad = 0;
     for (const row of formulaciones) {
@@ -118,6 +133,20 @@ export class FormulacionesCostosService {
       totalMateriaPrima += costoTotalMateria;
       totalCantidad += cantidadRecalc;
     }
+    return { totalMateriaPrima, totalCantidad };
+  }
+
+  // ── calculate_costs (GET formulaciones/costos/:id) ──
+  async calculateCosts(itemId: number, newVolume: number | null = null): Promise<Record<string, unknown>> {
+    if (!itemId) throw this.fail('Parámetro inválido: itemId requerido.');
+    const margenDef = await this.margenDefault();
+    const item = await this.fetchItemConCostosDetalle(itemId, margenDef);
+    const formulacionId = await this.fetchFormulacionIdActivaDeItem(N(item.id_item_general), item.nombre);
+    const formulaciones = await this.fetchIngredientesConCostoTotal(formulacionId, item.nombre);
+
+    const volumenBase = N(item.volumen_base);
+    const { factorVolumen, usarNuevoVolumen } = this.calcularFactorVolumen(volumenBase, newVolume);
+    const { totalMateriaPrima, totalCantidad } = this.sumarTotalesMateriaPrima(formulaciones, factorVolumen, usarNuevoVolumen);
 
     const nuevoCostoMateriaPrima = totalMateriaPrima;
     let divisorVolumen = newVolume ?? volumenBase;
