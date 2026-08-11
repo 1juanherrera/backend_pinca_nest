@@ -99,14 +99,8 @@ export class NotificacionService {
     return res.affectedRows;
   }
 
-  /**
-   * Lazy-cron: escanea el estado del sistema y genera notificaciones automáticas
-   * (stock crítico, OCs retrasadas, facturas en mora). Dedup por día vía crear().
-   */
-  async generarAutomaticas(): Promise<void> {
-    const day = (await this.dataSource.query(`SELECT DATE_FORMAT(CURDATE(),'%Y-%m-%d') AS d`))[0].d;
-
-    // 1. Stock crítico
+  /** 1. Stock crítico: MPs cuyos días de stock restante (proyectados por consumo reciente) caen bajo el umbral. */
+  private async generarNotifsStockCritico(day: string): Promise<void> {
     const criticoDias = N(await this.cfg.obtener('stock_critico_dias', 7));
     // Ventana (días) para medir el consumo y proyectar días de stock restante.
     // Configurable → alinea con los umbrales de stock (antes era 30 hardcodeado).
@@ -141,8 +135,10 @@ export class NotificacionService {
         });
       }
     }
+  }
 
-    // 2. OCs Enviadas sin recibir hace > N días (umbral configurable)
+  /** 2. OCs Enviadas sin recibir hace > N días (umbral configurable). */
+  private async generarNotifsOcsRetrasadas(day: string): Promise<void> {
     const ocDemora = Math.max(1, N(await this.cfg.obtener('oc_demora_dias', 14)));
     const ocs: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT oc.id_orden, oc.numero, oc.fecha, p.nombre_empresa AS proveedor_nombre,
@@ -163,8 +159,10 @@ export class NotificacionService {
         dedup_key: `oc-retrasada-${oc.id_orden}-${day}`,
       });
     }
+  }
 
-    // 3. Facturas en mora
+  /** 3. Facturas en mora crítica (umbral configurable). */
+  private async generarNotifsFacturasEnMora(day: string): Promise<void> {
     const moraCritica = N(await this.cfg.obtener('mora_critica_dias', 60));
     const facts: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT f.id_facturas, f.numero, f.saldo_pendiente, c.nombre_empresa AS cliente_nombre,
@@ -187,9 +185,13 @@ export class NotificacionService {
         dedup_key: `factura-mora-${f.id_facturas}-${day}`,
       });
     }
+  }
 
-    // 4. Facturas PRÓXIMAS a vencer (aviso preventivo N días antes del vencimiento;
-    //    N = dias_alerta_vencimiento de Configuración → antes este config no lo usaba nadie).
+  /**
+   * 4. Facturas PRÓXIMAS a vencer (aviso preventivo N días antes del vencimiento;
+   * N = dias_alerta_vencimiento de Configuración → antes este config no lo usaba nadie).
+   */
+  private async generarNotifsFacturasPorVencer(day: string): Promise<void> {
     const alertaDias = N(await this.cfg.obtener('dias_alerta_vencimiento', 3));
     const porVencer: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT f.id_facturas, f.numero, f.saldo_pendiente, c.nombre_empresa AS cliente_nombre,
@@ -215,6 +217,19 @@ export class NotificacionService {
         dedup_key: `factura-porvencer-${f.id_facturas}-${day}`,
       });
     }
+  }
+
+  /**
+   * Lazy-cron: escanea el estado del sistema y genera notificaciones automáticas
+   * (stock crítico, OCs retrasadas, facturas en mora). Dedup por día vía crear().
+   */
+  async generarAutomaticas(): Promise<void> {
+    const day = (await this.dataSource.query(`SELECT DATE_FORMAT(CURDATE(),'%Y-%m-%d') AS d`))[0].d;
+
+    await this.generarNotifsStockCritico(day);
+    await this.generarNotifsOcsRetrasadas(day);
+    await this.generarNotifsFacturasEnMora(day);
+    await this.generarNotifsFacturasPorVencer(day);
   }
 
   async crear(data: CrearNotif, m?: EntityManager): Promise<number | false> {
