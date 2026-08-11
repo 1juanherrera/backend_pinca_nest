@@ -15,150 +15,152 @@ const join = (parts: (string | null | undefined)[]) => parts.filter((p) => p != 
 export class SearchService {
   constructor(private readonly dataSource: DataSource) {}
 
-  async search(qRaw?: string, limitRaw?: string): Promise<Record<string, unknown>[]> {
-    const q = (qRaw ?? '').trim();
-    if (q === '' || [...q].length < 2) return [];
-    const limit = Math.max(1, Math.min(10, Math.trunc(Number(limitRaw) || 5)));
-    const like = `%${q}%`;
-    const out: Record<string, unknown>[] = [];
-
-    // ITEMS
-    const items: Record<string, unknown>[] = await this.dataSource.query(
+  private async buscarItems(like: string, q: string, limit: number): Promise<Record<string, unknown>[]> {
+    const rows: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT ig.id_item_general, ig.nombre, ig.codigo, ig.tipo FROM item_general ig
         WHERE (ig.nombre LIKE ? OR ig.codigo LIKE ?) AND (ig.deleted_at IS NULL)
         ORDER BY (ig.nombre = ?) DESC, LENGTH(ig.nombre) ASC LIMIT ${limit}`,
       [like, like, q],
     );
     const tipoLabel: Record<number, string> = { 1: 'Materia prima', 2: 'Insumo', 0: 'Producto' };
-    for (const r of items) {
-      out.push({
-        tipo: 'item',
-        id: Number(r.id_item_general),
-        label: r.nombre,
-        sublabel: trimSep(`${r.codigo ?? ''} · ${tipoLabel[Number(r.tipo)] ?? '—'}`),
-        path: '/catalogo?q=' + rawurlencode(String(r.nombre)),
-      });
-    }
+    return rows.map((r) => ({
+      tipo: 'item',
+      id: Number(r.id_item_general),
+      label: r.nombre,
+      sublabel: trimSep(`${r.codigo ?? ''} · ${tipoLabel[Number(r.tipo)] ?? '—'}`),
+      path: '/catalogo?q=' + rawurlencode(String(r.nombre)),
+    }));
+  }
 
-    // CLIENTES
-    const clientes: Record<string, unknown>[] = await this.dataSource.query(
+  private async buscarClientes(like: string, q: string, limit: number): Promise<Record<string, unknown>[]> {
+    const rows: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT id_clientes, nombre_empresa, nombre_encargado, numero_documento, ciudad FROM clientes
         WHERE (nombre_empresa LIKE ? OR nombre_encargado LIKE ? OR numero_documento LIKE ?) AND deleted_at IS NULL
         ORDER BY (nombre_empresa = ?) DESC, LENGTH(nombre_empresa) ASC LIMIT ${limit}`,
       [like, like, like, q],
     );
-    for (const r of clientes) {
-      out.push({
-        tipo: 'cliente',
-        id: Number(r.id_clientes),
-        label: r.nombre_empresa ?? '—',
-        sublabel: join([r.nombre_encargado as string, r.numero_documento ? `NIT ${r.numero_documento}` : '', r.ciudad as string]),
-        path: '/clientes?q=' + rawurlencode(String(r.nombre_empresa ?? '')),
-      });
-    }
+    return rows.map((r) => ({
+      tipo: 'cliente',
+      id: Number(r.id_clientes),
+      label: r.nombre_empresa ?? '—',
+      sublabel: join([r.nombre_encargado as string, r.numero_documento ? `NIT ${r.numero_documento}` : '', r.ciudad as string]),
+      path: '/clientes?q=' + rawurlencode(String(r.nombre_empresa ?? '')),
+    }));
+  }
 
-    // PROVEEDORES
-    const proveedores: Record<string, unknown>[] = await this.dataSource.query(
+  private async buscarProveedores(like: string, q: string, limit: number): Promise<Record<string, unknown>[]> {
+    const rows: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT id_proveedor, nombre_empresa, nombre_encargado, numero_documento FROM proveedor
         WHERE (nombre_empresa LIKE ? OR nombre_encargado LIKE ? OR numero_documento LIKE ?) AND deleted_at IS NULL
         ORDER BY (nombre_empresa = ?) DESC, LENGTH(nombre_empresa) ASC LIMIT ${limit}`,
       [like, like, like, q],
     );
-    for (const r of proveedores) {
-      out.push({
-        tipo: 'proveedor',
-        id: Number(r.id_proveedor),
-        label: r.nombre_empresa ?? '—',
-        sublabel: join([r.nombre_encargado as string, r.numero_documento ? `NIT ${r.numero_documento}` : '']),
-        path: '/proveedores?q=' + rawurlencode(String(r.nombre_empresa ?? '')),
-      });
-    }
+    return rows.map((r) => ({
+      tipo: 'proveedor',
+      id: Number(r.id_proveedor),
+      label: r.nombre_empresa ?? '—',
+      sublabel: join([r.nombre_encargado as string, r.numero_documento ? `NIT ${r.numero_documento}` : '']),
+      path: '/proveedores?q=' + rawurlencode(String(r.nombre_empresa ?? '')),
+    }));
+  }
 
-    // FACTURAS
-    const facturas: Record<string, unknown>[] = await this.dataSource.query(
+  private async buscarFacturas(like: string, limit: number): Promise<Record<string, unknown>[]> {
+    const rows: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT f.id_facturas, f.numero, f.estado, f.total, f.fecha_emision, c.nombre_empresa AS cliente_nombre
          FROM facturas f LEFT JOIN clientes c ON c.id_clientes = f.cliente_id
         WHERE f.numero LIKE ? AND f.deleted_at IS NULL ORDER BY f.fecha_emision DESC LIMIT ${limit}`,
       [like],
     );
-    for (const r of facturas) {
-      out.push({
-        tipo: 'factura',
-        id: Number(r.id_facturas),
-        label: r.numero,
-        sublabel: join([r.cliente_nombre as string, `$${nfDot(r.total)}`, r.estado as string]),
-        path: '/comercial?tab=facturas&q=' + rawurlencode(String(r.numero)),
-      });
-    }
+    return rows.map((r) => ({
+      tipo: 'factura',
+      id: Number(r.id_facturas),
+      label: r.numero,
+      sublabel: join([r.cliente_nombre as string, `$${nfDot(r.total)}`, r.estado as string]),
+      path: '/comercial?tab=facturas&q=' + rawurlencode(String(r.numero)),
+    }));
+  }
 
-    // COTIZACIONES
-    const cotiz: Record<string, unknown>[] = await this.dataSource.query(
+  private async buscarCotizaciones(like: string, limit: number): Promise<Record<string, unknown>[]> {
+    const rows: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT co.id_cotizaciones, co.numero, co.estado, co.total, co.fecha_cotizacion, c.nombre_empresa AS cliente_nombre
          FROM cotizaciones co LEFT JOIN clientes c ON c.id_clientes = co.cliente_id
         WHERE co.numero LIKE ? AND co.deleted_at IS NULL ORDER BY co.fecha_cotizacion DESC LIMIT ${limit}`,
       [like],
     );
-    for (const r of cotiz) {
-      out.push({
-        tipo: 'cotizacion',
-        id: Number(r.id_cotizaciones),
-        label: r.numero,
-        sublabel: join([r.cliente_nombre as string, `$${nfDot(r.total)}`, r.estado as string]),
-        path: '/comercial?tab=cotizaciones&q=' + rawurlencode(String(r.numero)),
-      });
-    }
+    return rows.map((r) => ({
+      tipo: 'cotizacion',
+      id: Number(r.id_cotizaciones),
+      label: r.numero,
+      sublabel: join([r.cliente_nombre as string, `$${nfDot(r.total)}`, r.estado as string]),
+      path: '/comercial?tab=cotizaciones&q=' + rawurlencode(String(r.numero)),
+    }));
+  }
 
-    // REMISIONES
-    const remi: Record<string, unknown>[] = await this.dataSource.query(
+  private async buscarRemisiones(like: string, limit: number): Promise<Record<string, unknown>[]> {
+    const rows: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT r.id_remisiones, r.numero, r.estado, r.fecha_remision, c.nombre_empresa AS cliente_nombre
          FROM remisiones r LEFT JOIN clientes c ON c.id_clientes = r.cliente_id
         WHERE r.numero LIKE ? AND r.deleted_at IS NULL ORDER BY r.fecha_remision DESC LIMIT ${limit}`,
       [like],
     );
-    for (const r of remi) {
-      out.push({
-        tipo: 'remision',
-        id: Number(r.id_remisiones),
-        label: r.numero,
-        sublabel: join([r.cliente_nombre as string, r.estado as string]),
-        path: '/comercial?tab=remisiones&q=' + rawurlencode(String(r.numero)),
-      });
-    }
+    return rows.map((r) => ({
+      tipo: 'remision',
+      id: Number(r.id_remisiones),
+      label: r.numero,
+      sublabel: join([r.cliente_nombre as string, r.estado as string]),
+      path: '/comercial?tab=remisiones&q=' + rawurlencode(String(r.numero)),
+    }));
+  }
 
-    // ÓRDENES DE COMPRA
-    const ocs: Record<string, unknown>[] = await this.dataSource.query(
+  private async buscarOrdenesCompra(like: string, limit: number): Promise<Record<string, unknown>[]> {
+    const rows: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT oc.id_orden, oc.numero, oc.estado, oc.total, oc.fecha, p.nombre_empresa AS proveedor_nombre
          FROM ordenes_compra oc LEFT JOIN proveedor p ON p.id_proveedor = oc.proveedor_id
         WHERE oc.numero LIKE ? AND oc.deleted_at IS NULL ORDER BY oc.fecha DESC LIMIT ${limit}`,
       [like],
     );
-    for (const r of ocs) {
-      out.push({
-        tipo: 'orden_compra',
-        id: Number(r.id_orden),
-        label: r.numero,
-        sublabel: join([r.proveedor_nombre as string, `$${nfDot(r.total)}`, r.estado as string]),
-        path: '/compras?q=' + rawurlencode(String(r.numero)),
-      });
-    }
+    return rows.map((r) => ({
+      tipo: 'orden_compra',
+      id: Number(r.id_orden),
+      label: r.numero,
+      sublabel: join([r.proveedor_nombre as string, `$${nfDot(r.total)}`, r.estado as string]),
+      path: '/compras?q=' + rawurlencode(String(r.numero)),
+    }));
+  }
 
-    // NOTAS DE CRÉDITO
-    const ncs: Record<string, unknown>[] = await this.dataSource.query(
+  private async buscarNotasCredito(like: string, limit: number): Promise<Record<string, unknown>[]> {
+    const rows: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT nc.id_nota_credito, nc.numero, nc.estado, nc.monto, nc.fecha, c.nombre_empresa AS cliente_nombre
          FROM notas_credito nc LEFT JOIN clientes c ON c.id_clientes = nc.clientes_id
         WHERE nc.numero LIKE ? ORDER BY nc.fecha DESC LIMIT ${limit}`,
       [like],
     );
-    for (const r of ncs) {
-      out.push({
-        tipo: 'nota_credito',
-        id: Number(r.id_nota_credito),
-        label: r.numero,
-        sublabel: join([r.cliente_nombre as string, `$${nfDot(r.monto)}`, r.estado as string]),
-        path: '/cartera?q=' + rawurlencode(String(r.numero)),
-      });
-    }
+    return rows.map((r) => ({
+      tipo: 'nota_credito',
+      id: Number(r.id_nota_credito),
+      label: r.numero,
+      sublabel: join([r.cliente_nombre as string, `$${nfDot(r.monto)}`, r.estado as string]),
+      path: '/cartera?q=' + rawurlencode(String(r.numero)),
+    }));
+  }
 
-    return out;
+  async search(qRaw?: string, limitRaw?: string): Promise<Record<string, unknown>[]> {
+    const q = (qRaw ?? '').trim();
+    if (q === '' || [...q].length < 2) return [];
+    const limit = Math.max(1, Math.min(10, Math.trunc(Number(limitRaw) || 5)));
+    const like = `%${q}%`;
+
+    const [items, clientes, proveedores, facturas, cotiz, remi, ocs, ncs] = await Promise.all([
+      this.buscarItems(like, q, limit),
+      this.buscarClientes(like, q, limit),
+      this.buscarProveedores(like, q, limit),
+      this.buscarFacturas(like, limit),
+      this.buscarCotizaciones(like, limit),
+      this.buscarRemisiones(like, limit),
+      this.buscarOrdenesCompra(like, limit),
+      this.buscarNotasCredito(like, limit),
+    ]);
+
+    return [...items, ...clientes, ...proveedores, ...facturas, ...cotiz, ...remi, ...ocs, ...ncs];
   }
 }
