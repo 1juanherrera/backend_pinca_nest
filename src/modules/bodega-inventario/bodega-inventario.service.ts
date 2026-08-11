@@ -14,41 +14,40 @@ export class BodegaInventarioService {
     private readonly cfg: ConfiguracionService,
   ) {}
 
-  async bodegaInventario(
-    id: number,
-    pageRaw?: string,
-    perPageRaw?: string,
-    search = '',
-    tipo = '',
-  ): Promise<Record<string, unknown>> {
+  private async fetchBodega(id: number): Promise<Record<string, unknown>> {
     const bodega = (await this.dataSource.query(
       `SELECT * FROM bodegas WHERE id_bodegas = ? AND deleted_at IS NULL`,
       [id],
     ))[0];
     if (!bodega) throw new HttpException({ msg: `Bodega con ID ${id} no encontrada.` }, 404);
+    return bodega;
+  }
 
-    const perPage = Math.trunc(Number(perPageRaw) || 10);
-    const page = Math.trunc(Number(pageRaw) || 1);
-    const offset = (page - 1) * perPage;
-
+  private buildWhereClause(id: number, search: string, tipo: string): { where: string; params: unknown[] } {
     let where = ' WHERE inv.bodegas_id = ? ';
     const params: unknown[] = [id];
     if (search) { where += ' AND (ig.nombre LIKE ? OR ig.codigo LIKE ?) '; params.push(`%${search}%`, `%${search}%`); }
     if (tipo !== '' && tipo !== null) { where += ' AND ig.tipo = ? '; params.push(tipo); }
+    return { where, params };
+  }
 
-    const totalItems = N(
+  private async contarTotal(where: string, params: unknown[]): Promise<number> {
+    return N(
       (await this.dataSource.query(
         `SELECT COUNT(*) AS total FROM inventario inv
            JOIN item_general ig ON inv.item_general_id = ig.id_item_general ${where}`,
         params,
       ))[0].total,
     );
+  }
 
-    // Nota: CI4 agrega el filtro `inv.cantidad IS NULL` SOLO al query principal (no al count)
-    // cuando tipo==='pendientes' (que además ya filtró ig.tipo='pendientes' → 0 filas). Se replica.
-    if (tipo === 'pendientes') where += ' AND inv.cantidad IS NULL ';
-
-    const inventario: Record<string, unknown>[] = await this.dataSource.query(
+  private async fetchInventarioPagina(
+    where: string,
+    params: unknown[],
+    perPage: number,
+    offset: number,
+  ): Promise<Record<string, unknown>[]> {
+    return this.dataSource.query(
       `SELECT inv.id_inventario, ig.id_item_general, ig.nombre, ig.codigo,
               inv.cantidad, ig.tipo, ca.nombre AS categoria,
               u.nombre AS unidad, u.escala AS escala_venta, u.id_unidad AS unidad_id,
@@ -67,6 +66,93 @@ export class BodegaInventarioService {
         ${where} LIMIT ${perPage} OFFSET ${offset}`,
       params,
     );
+  }
+
+  /**
+   * Adjunta `.formulacion` a cada ítem con fórmula activa, en 2 queries TOTALES
+   * con IN(...) + mapas en memoria (antes: 2 queries POR ítem — N+1, una página
+   * de 200 ítems ≈ 400 queries). Muta `conFormula` in-place.
+   */
+  private async enriquecerConFormulas(conFormula: Record<string, unknown>[], margenDef: number): Promise<void> {
+    if (!conFormula.length) return;
+    const itemIds = [...new Set(conFormula.map((it) => Number(it.id_item_general)))];
+    const formIds = [...new Set(conFormula.map((it) => Number(it.formulacion_id)))];
+    const itemPh = itemIds.map(() => '?').join(',');
+    const formPh = formIds.map(() => '?').join(',');
+
+    const itemDatas: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT ig.id_item_general, ig.viscosidad, ig.p_g, ig.color, ig.secado, ig.cubrimiento, ig.brillo_60,
+              COALESCE(NULLIF(ci.volumen,0),1) AS volumen_base, COALESCE(ci.envase,0) AS envase,
+              COALESCE(ci.etiqueta,0) AS etiqueta, COALESCE(ci.bandeja,0) AS bandeja,
+              COALESCE(ci.plastico,0) AS plastico, COALESCE(ci.costo_mod,0) AS costo_mod,
+              COALESCE(ci.porcentaje_utilidad, ?) AS porcentaje_utilidad
+         FROM item_general ig LEFT JOIN costos_item ci ON ci.item_general_id = ig.id_item_general
+        WHERE ig.id_item_general IN (${itemPh})`,
+      [margenDef, ...itemIds],
+    );
+    const itemDataMap = new Map<number, Record<string, unknown>>();
+    for (const d of itemDatas) itemDataMap.set(Number(d.id_item_general), d);
+
+    const mpsAll: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT igf.id_item_general_formulaciones, igf.formulaciones_id,
+              igf.item_general_id AS materia_prima_id, igf.cantidad,
+              ig.nombre, ig.codigo, COALESCE(ci.costo_unitario,0) AS costo_unitario,
+              (igf.cantidad * COALESCE(ci.costo_unitario,0)) AS costo_total,
+              (SELECT COALESCE(SUM(i.cantidad),0) FROM inventario i WHERE i.item_general_id = ig.id_item_general) AS inventario_cantidad
+         FROM item_general_formulaciones igf
+         INNER JOIN item_general ig ON igf.item_general_id = ig.id_item_general
+         LEFT JOIN costos_item ci ON ig.id_item_general = ci.item_general_id
+        WHERE igf.formulaciones_id IN (${formPh}) ORDER BY ig.nombre ASC`,
+      formIds,
+    );
+    const mpsMap = new Map<number, Record<string, unknown>[]>();
+    for (const mp of mpsAll) {
+      const fid = Number(mp.formulaciones_id);
+      (mpsMap.get(fid) ?? mpsMap.set(fid, []).get(fid)!).push(mp);
+    }
+
+    for (const item of conFormula) {
+      const itemData = itemDataMap.get(Number(item.id_item_general)) ?? {};
+      const mps = mpsMap.get(Number(item.formulacion_id)) ?? [];
+      item.formulacion = {
+        item: {
+          viscosidad: itemData.viscosidad, p_g: itemData.p_g, color: itemData.color,
+          secado: itemData.secado, cubrimiento: itemData.cubrimiento, brillo_60: itemData.brillo_60,
+          volumen_base: N(itemData.volumen_base), envase: N(itemData.envase), etiqueta: N(itemData.etiqueta),
+          bandeja: N(itemData.bandeja), plastico: N(itemData.plastico), costo_mod: N(itemData.costo_mod),
+          porcentaje_utilidad: N(itemData.porcentaje_utilidad),
+        },
+        materias_primas: mps.map((mp) => ({
+          id: N(mp.id_item_general_formulaciones), formulaciones_id: N(mp.formulaciones_id),
+          materia_prima_id: N(mp.materia_prima_id), nombre: mp.nombre, codigo: mp.codigo,
+          cantidad: N(mp.cantidad), costo_unitario: N(mp.costo_unitario), costo_total: N(mp.costo_total),
+          inventario_cantidad: N(mp.inventario_cantidad),
+        })),
+      };
+    }
+  }
+
+  async bodegaInventario(
+    id: number,
+    pageRaw?: string,
+    perPageRaw?: string,
+    search = '',
+    tipo = '',
+  ): Promise<Record<string, unknown>> {
+    const bodega = await this.fetchBodega(id);
+
+    const perPage = Math.trunc(Number(perPageRaw) || 10);
+    const page = Math.trunc(Number(pageRaw) || 1);
+    const offset = (page - 1) * perPage;
+
+    const { where, params } = this.buildWhereClause(id, search, tipo);
+    const totalItems = await this.contarTotal(where, params);
+
+    // Nota: CI4 agrega el filtro `inv.cantidad IS NULL` SOLO al query principal (no al count)
+    // cuando tipo==='pendientes' (que además ya filtró ig.tipo='pendientes' → 0 filas). Se replica.
+    const whereConPendientes = tipo === 'pendientes' ? where + ' AND inv.cantidad IS NULL ' : where;
+
+    const inventario = await this.fetchInventarioPagina(whereConPendientes, params, perPage, offset);
 
     const margenDef = N(await this.cfg.obtener('margen_utilidad_default_pct', 50));
 
@@ -74,65 +160,8 @@ export class BodegaInventarioService {
     for (const item of inventario) item.formulacion_id = iNull(item.formulacion_id);
     const conFormula = inventario.filter((it) => it.formulacion_id !== null);
 
-    // Antes: 2 queries POR ítem con fórmula (N+1: una página de 200 ítems ≈ 400
-    // queries). Ahora: 2 queries TOTALES con IN(...) + mapas en memoria.
-    if (conFormula.length > 0) {
-      const itemIds = [...new Set(conFormula.map((it) => Number(it.id_item_general)))];
-      const formIds = [...new Set(conFormula.map((it) => Number(it.formulacion_id)))];
-      const itemPh = itemIds.map(() => '?').join(',');
-      const formPh = formIds.map(() => '?').join(',');
+    await this.enriquecerConFormulas(conFormula, margenDef);
 
-      const itemDatas: Record<string, unknown>[] = await this.dataSource.query(
-        `SELECT ig.id_item_general, ig.viscosidad, ig.p_g, ig.color, ig.secado, ig.cubrimiento, ig.brillo_60,
-                COALESCE(NULLIF(ci.volumen,0),1) AS volumen_base, COALESCE(ci.envase,0) AS envase,
-                COALESCE(ci.etiqueta,0) AS etiqueta, COALESCE(ci.bandeja,0) AS bandeja,
-                COALESCE(ci.plastico,0) AS plastico, COALESCE(ci.costo_mod,0) AS costo_mod,
-                COALESCE(ci.porcentaje_utilidad, ?) AS porcentaje_utilidad
-           FROM item_general ig LEFT JOIN costos_item ci ON ci.item_general_id = ig.id_item_general
-          WHERE ig.id_item_general IN (${itemPh})`,
-        [margenDef, ...itemIds],
-      );
-      const itemDataMap = new Map<number, Record<string, unknown>>();
-      for (const d of itemDatas) itemDataMap.set(Number(d.id_item_general), d);
-
-      const mpsAll: Record<string, unknown>[] = await this.dataSource.query(
-        `SELECT igf.id_item_general_formulaciones, igf.formulaciones_id,
-                igf.item_general_id AS materia_prima_id, igf.cantidad,
-                ig.nombre, ig.codigo, COALESCE(ci.costo_unitario,0) AS costo_unitario,
-                (igf.cantidad * COALESCE(ci.costo_unitario,0)) AS costo_total,
-                (SELECT COALESCE(SUM(i.cantidad),0) FROM inventario i WHERE i.item_general_id = ig.id_item_general) AS inventario_cantidad
-           FROM item_general_formulaciones igf
-           INNER JOIN item_general ig ON igf.item_general_id = ig.id_item_general
-           LEFT JOIN costos_item ci ON ig.id_item_general = ci.item_general_id
-          WHERE igf.formulaciones_id IN (${formPh}) ORDER BY ig.nombre ASC`,
-        formIds,
-      );
-      const mpsMap = new Map<number, Record<string, unknown>[]>();
-      for (const mp of mpsAll) {
-        const fid = Number(mp.formulaciones_id);
-        (mpsMap.get(fid) ?? mpsMap.set(fid, []).get(fid)!).push(mp);
-      }
-
-      for (const item of conFormula) {
-        const itemData = itemDataMap.get(Number(item.id_item_general)) ?? {};
-        const mps = mpsMap.get(Number(item.formulacion_id)) ?? [];
-        item.formulacion = {
-          item: {
-            viscosidad: itemData.viscosidad, p_g: itemData.p_g, color: itemData.color,
-            secado: itemData.secado, cubrimiento: itemData.cubrimiento, brillo_60: itemData.brillo_60,
-            volumen_base: N(itemData.volumen_base), envase: N(itemData.envase), etiqueta: N(itemData.etiqueta),
-            bandeja: N(itemData.bandeja), plastico: N(itemData.plastico), costo_mod: N(itemData.costo_mod),
-            porcentaje_utilidad: N(itemData.porcentaje_utilidad),
-          },
-          materias_primas: mps.map((mp) => ({
-            id: N(mp.id_item_general_formulaciones), formulaciones_id: N(mp.formulaciones_id),
-            materia_prima_id: N(mp.materia_prima_id), nombre: mp.nombre, codigo: mp.codigo,
-            cantidad: N(mp.cantidad), costo_unitario: N(mp.costo_unitario), costo_total: N(mp.costo_total),
-            inventario_cantidad: N(mp.inventario_cantidad),
-          })),
-        };
-      }
-    }
     for (const item of inventario) {
       if (item.formulacion_id === null) item.formulacion = null;
     }

@@ -3,7 +3,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { DataSource } from 'typeorm';
+import { DataSource, EntityManager } from 'typeorm';
 
 import { CapasService, MOV } from './capas.service';
 import { AjusteManualDto } from './dto/ajuste-manual.dto';
@@ -94,6 +94,129 @@ export class InventarioService {
     return Math.round(n * 10000) / 10000;
   }
 
+  /** Capas de origen con lock (`FOR UPDATE`) + valida que cubran la cantidad a traspasar. */
+  private async fetchCapasOrigenConLock(
+    m: EntityManager,
+    itemId: number,
+    origen: number,
+    cantidad: number,
+  ): Promise<{ capasOrigen: Record<string, unknown>[]; saldoOrigenAntes: number }> {
+    const capasOrigen: Record<string, unknown>[] = await m.query(
+      `SELECT * FROM inventario_capas
+        WHERE item_general_id = ? AND bodegas_id = ? AND estado = 1 AND cantidad_disponible > 0
+        ORDER BY fecha_ingreso ASC, id_capa ASC FOR UPDATE`,
+      [itemId, origen],
+    );
+    const saldoOrigenAntes = capasOrigen.reduce((a, c) => a + Number(c.cantidad_disponible), 0);
+    if (saldoOrigenAntes + 0.0001 < cantidad) {
+      throw new BadRequestException('Error al realizar el traspaso');
+    }
+    return { capasOrigen, saldoOrigenAntes };
+  }
+
+  private async fetchSaldoDestino(m: EntityManager, itemId: number, destino: number): Promise<number> {
+    const destRows: { s: string }[] = await m.query(
+      `SELECT COALESCE(SUM(cantidad_disponible), 0) AS s FROM inventario_capas
+        WHERE item_general_id = ? AND bodegas_id = ? AND estado = 1`,
+      [itemId, destino],
+    );
+    return Number(destRows[0].s ?? 0);
+  }
+
+  /** Mueve capas FIFO de origen→destino: mueve la capa entera si se consume toda, o la parte en una capa nueva. */
+  private async moverCapasFIFO(
+    m: EntityManager,
+    itemId: number,
+    destino: number,
+    capasOrigen: Record<string, unknown>[],
+    cantidad: number,
+  ): Promise<void> {
+    let restante = cantidad;
+    for (const capa of capasOrigen) {
+      if (restante <= 0.0001) break;
+      const disp = Number(capa.cantidad_disponible);
+      const mover = Math.min(restante, disp);
+      if (mover >= disp - 0.0001) {
+        await m.query(
+          `UPDATE inventario_capas SET bodegas_id = ? WHERE id_capa = ?`,
+          [destino, Number(capa.id_capa)],
+        );
+      } else {
+        await m.query(
+          `UPDATE inventario_capas SET cantidad_disponible = cantidad_disponible - ? WHERE id_capa = ?`,
+          [mover, Number(capa.id_capa)],
+        );
+        await m.query(
+          `INSERT INTO inventario_capas
+             (item_general_id, bodegas_id, proveedor_id, item_proveedor_id, orden_compra_id,
+              cantidad_original, cantidad_disponible, costo_unitario, unidad_compra_id,
+              factor_conversion, precio_compra, fecha_ingreso, lote_proveedor, observaciones, estado)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+          [
+            itemId,
+            destino,
+            capa.proveedor_id,
+            capa.item_proveedor_id,
+            capa.orden_compra_id,
+            mover,
+            mover,
+            capa.costo_unitario,
+            capa.unidad_compra_id,
+            capa.factor_conversion,
+            capa.precio_compra,
+            capa.fecha_ingreso,
+            capa.lote_proveedor,
+            capa.observaciones,
+          ],
+        );
+      }
+      restante -= mover;
+    }
+  }
+
+  /** Refleja el traspaso en el inventario legacy (best-effort, no bloquea el flujo de capas). */
+  private async actualizarInventarioLegacy(
+    m: EntityManager,
+    itemId: number,
+    origen: number,
+    destino: number,
+    cantidad: number,
+  ): Promise<void> {
+    await m.query(
+      `UPDATE inventario SET cantidad = GREATEST(cantidad - ?, 0) WHERE item_general_id = ? AND bodegas_id = ?`,
+      [cantidad, itemId, origen],
+    );
+    await m.query(
+      `DELETE FROM inventario WHERE item_general_id = ? AND bodegas_id = ? AND cantidad = 0`,
+      [itemId, origen],
+    );
+    const checkDest: unknown[] = await m.query(
+      `SELECT id_inventario FROM inventario WHERE item_general_id = ? AND bodegas_id = ?`,
+      [itemId, destino],
+    );
+    if (checkDest.length) {
+      await m.query(
+        `UPDATE inventario SET cantidad = cantidad + ? WHERE item_general_id = ? AND bodegas_id = ?`,
+        [cantidad, itemId, destino],
+      );
+    } else {
+      await m.query(
+        `INSERT INTO inventario (item_general_id, bodegas_id, cantidad, estado, tipo) VALUES (?, ?, ?, 1, 1)`,
+        [itemId, destino, cantidad],
+      );
+    }
+  }
+
+  private async fetchNombresBodegas(
+    m: EntityManager,
+    origen: number,
+    destino: number,
+  ): Promise<{ nomOrigen: string | null; nomDestino: string | null }> {
+    const bo: { nombre: string }[] = await m.query(`SELECT nombre FROM bodegas WHERE id_bodegas = ?`, [origen]);
+    const bd: { nombre: string }[] = await m.query(`SELECT nombre FROM bodegas WHERE id_bodegas = ?`, [destino]);
+    return { nomOrigen: bo[0]?.nombre ?? null, nomDestino: bd[0]?.nombre ?? null };
+  }
+
   /** POST /inventario/traspaso — mueve stock entre bodegas (capas FIFO, preserva costo/lote). */
   async traspaso(dto: TraspasoDto, username: string): Promise<void> {
     const itemId = Number(dto.item_id);
@@ -105,106 +228,16 @@ export class InventarioService {
     }
 
     await this.dataSource.transaction(async (m) => {
-      const capasOrigen: Record<string, unknown>[] = await m.query(
-        `SELECT * FROM inventario_capas
-          WHERE item_general_id = ? AND bodegas_id = ? AND estado = 1 AND cantidad_disponible > 0
-          ORDER BY fecha_ingreso ASC, id_capa ASC FOR UPDATE`,
-        [itemId, origen],
-      );
-      const saldoOrigenAntes = capasOrigen.reduce(
-        (a, c) => a + Number(c.cantidad_disponible),
-        0,
-      );
-      if (saldoOrigenAntes + 0.0001 < cantidad) {
-        throw new BadRequestException('Error al realizar el traspaso');
-      }
-      const destRows: { s: string }[] = await m.query(
-        `SELECT COALESCE(SUM(cantidad_disponible), 0) AS s FROM inventario_capas
-          WHERE item_general_id = ? AND bodegas_id = ? AND estado = 1`,
-        [itemId, destino],
-      );
-      const saldoDestinoAntes = Number(destRows[0].s ?? 0);
+      const { capasOrigen, saldoOrigenAntes } = await this.fetchCapasOrigenConLock(m, itemId, origen, cantidad);
+      const saldoDestinoAntes = await this.fetchSaldoDestino(m, itemId, destino);
 
-      let restante = cantidad;
-      for (const capa of capasOrigen) {
-        if (restante <= 0.0001) break;
-        const disp = Number(capa.cantidad_disponible);
-        const mover = Math.min(restante, disp);
-        if (mover >= disp - 0.0001) {
-          await m.query(
-            `UPDATE inventario_capas SET bodegas_id = ? WHERE id_capa = ?`,
-            [destino, Number(capa.id_capa)],
-          );
-        } else {
-          await m.query(
-            `UPDATE inventario_capas SET cantidad_disponible = cantidad_disponible - ? WHERE id_capa = ?`,
-            [mover, Number(capa.id_capa)],
-          );
-          await m.query(
-            `INSERT INTO inventario_capas
-               (item_general_id, bodegas_id, proveedor_id, item_proveedor_id, orden_compra_id,
-                cantidad_original, cantidad_disponible, costo_unitario, unidad_compra_id,
-                factor_conversion, precio_compra, fecha_ingreso, lote_proveedor, observaciones, estado)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
-            [
-              itemId,
-              destino,
-              capa.proveedor_id,
-              capa.item_proveedor_id,
-              capa.orden_compra_id,
-              mover,
-              mover,
-              capa.costo_unitario,
-              capa.unidad_compra_id,
-              capa.factor_conversion,
-              capa.precio_compra,
-              capa.fecha_ingreso,
-              capa.lote_proveedor,
-              capa.observaciones,
-            ],
-          );
-        }
-        restante -= mover;
-      }
+      await this.moverCapasFIFO(m, itemId, destino, capasOrigen, cantidad);
 
       const saldoOrigenDespues = saldoOrigenAntes - cantidad;
       const saldoDestinoDespues = saldoDestinoAntes + cantidad;
 
-      // legacy inventario (best-effort)
-      await m.query(
-        `UPDATE inventario SET cantidad = GREATEST(cantidad - ?, 0) WHERE item_general_id = ? AND bodegas_id = ?`,
-        [cantidad, itemId, origen],
-      );
-      await m.query(
-        `DELETE FROM inventario WHERE item_general_id = ? AND bodegas_id = ? AND cantidad = 0`,
-        [itemId, origen],
-      );
-      const checkDest: unknown[] = await m.query(
-        `SELECT id_inventario FROM inventario WHERE item_general_id = ? AND bodegas_id = ?`,
-        [itemId, destino],
-      );
-      if (checkDest.length) {
-        await m.query(
-          `UPDATE inventario SET cantidad = cantidad + ? WHERE item_general_id = ? AND bodegas_id = ?`,
-          [cantidad, itemId, destino],
-        );
-      } else {
-        await m.query(
-          `INSERT INTO inventario (item_general_id, bodegas_id, cantidad, estado, tipo) VALUES (?, ?, ?, 1, 1)`,
-          [itemId, destino, cantidad],
-        );
-      }
-
-      const bo: { nombre: string }[] = await m.query(
-        `SELECT nombre FROM bodegas WHERE id_bodegas = ?`,
-        [origen],
-      );
-      const bd: { nombre: string }[] = await m.query(
-        `SELECT nombre FROM bodegas WHERE id_bodegas = ?`,
-        [destino],
-      );
-      const nomOrigen = bo[0]?.nombre ?? null;
-      const nomDestino = bd[0]?.nombre ?? null;
+      await this.actualizarInventarioLegacy(m, itemId, origen, destino, cantidad);
+      const { nomOrigen, nomDestino } = await this.fetchNombresBodegas(m, origen, destino);
 
       await this.capas.registrarMovimiento(m, {
         tipo: MOV.TIPO_TRASPASO,
