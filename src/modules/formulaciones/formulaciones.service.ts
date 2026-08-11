@@ -104,11 +104,7 @@ export class FormulacionesService {
     };
   }
 
-  // ── DETAIL por item — GET /formulacion_item/:itemId → { status:'success', data } ──
-  async getFormulacionConMateriasPrimas(
-    itemId: number,
-  ): Promise<Record<string, unknown>> {
-    const margen = await this.margenDefault();
+  private async fetchItemConCostos(itemId: number, margen: number): Promise<Record<string, unknown>> {
     const itemRows: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT ig.id_item_general, ig.nombre, ig.codigo, ig.tipo, ig.viscosidad, ig.p_g,
               ig.color, ig.secado, ig.cubrimiento, ig.brillo_60,
@@ -127,19 +123,26 @@ export class FormulacionesService {
     if (!itemRows.length) {
       throw new NotFoundException(`Item con ID ${itemId} no encontrado.`);
     }
-    const item = itemRows[0];
+    return itemRows[0];
+  }
 
+  private async fetchFormulacionActiva(itemId: number, itemNombre: unknown): Promise<Record<string, unknown>> {
     const formRows: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT id_formulaciones, nombre, descripcion FROM formulaciones WHERE item_general_id = ? AND estado = 1 LIMIT 1`,
       [itemId],
     );
     if (!formRows.length) {
       throw new NotFoundException(
-        `El item '${String(item.nombre)}' no tiene una formulación activa.`,
+        `El item '${String(itemNombre)}' no tiene una formulación activa.`,
       );
     }
-    const formulacion = formRows[0];
+    return formRows[0];
+  }
 
+  private async fetchMateriasPrimasDeFormula(
+    formulacionId: number,
+    itemNombre: unknown,
+  ): Promise<Record<string, unknown>[]> {
     const mps: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT igf.id_item_general_formulaciones, igf.formulaciones_id,
               igf.item_general_id AS materia_prima_id, igf.cantidad, igf.orden, igf.tipo,
@@ -159,13 +162,24 @@ export class FormulacionesService {
          LEFT JOIN inventario i ON ig.id_item_general = i.item_general_id
         WHERE igf.formulaciones_id = ?
         ORDER BY igf.orden ASC, ig.nombre ASC`,
-      [formulacion.id_formulaciones],
+      [formulacionId],
     );
     if (!mps.length) {
       throw new NotFoundException(
-        `La formulación del item '${String(item.nombre)}' no tiene materias primas asignadas.`,
+        `La formulación del item '${String(itemNombre)}' no tiene materias primas asignadas.`,
       );
     }
+    return mps;
+  }
+
+  // ── DETAIL por item — GET /formulacion_item/:itemId → { status:'success', data } ──
+  async getFormulacionConMateriasPrimas(
+    itemId: number,
+  ): Promise<Record<string, unknown>> {
+    const margen = await this.margenDefault();
+    const item = await this.fetchItemConCostos(itemId, margen);
+    const formulacion = await this.fetchFormulacionActiva(itemId, item.nombre);
+    const mps = await this.fetchMateriasPrimasDeFormula(Number(formulacion.id_formulaciones), item.nombre);
 
     return {
       item: {
