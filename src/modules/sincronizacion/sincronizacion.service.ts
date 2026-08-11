@@ -1030,6 +1030,130 @@ export class SincronizacionService {
     return { item_id: itemId, origen_stock: stock, formulas: await this.formulasQueUsan(itemId, to > 0 ? to : null) };
   }
 
+  private async validarItemsReemplazo(
+    fromId: number,
+    toId: number,
+  ): Promise<{ from: Record<string, unknown>; to: Record<string, unknown> }> {
+    if (fromId === toId) throw this.fail('La materia origen y la de reemplazo no pueden ser la misma.', 422);
+    const from = (await this.dataSource.query(`SELECT nombre FROM item_general WHERE id_item_general = ?`, [fromId]))[0];
+    const to = (await this.dataSource.query(`SELECT nombre FROM item_general WHERE id_item_general = ?`, [toId]))[0];
+    if (!from) throw this.fail('La materia origen no existe.', 422);
+    if (!to) throw this.fail('La materia de reemplazo no existe.', 422);
+    return { from, to };
+  }
+
+  private resolverScopeFormulaciones(formulacionIds: unknown[] | null): number[] | null {
+    if (!Array.isArray(formulacionIds) || !formulacionIds.length) return null;
+    const scope = [...new Set(formulacionIds.map((x) => Math.trunc(Number(x))).filter((x) => x > 0))];
+    return scope.length ? scope : null;
+  }
+
+  private async fetchFormulasAgrupadasPorMp(
+    m: EntityManager,
+    fromId: number,
+    scope: number[] | null,
+  ): Promise<Record<string, unknown>[]> {
+    let grpSql = `SELECT formulaciones_id, SUM(cantidad) AS sc, SUM(porcentaje) AS sp
+                    FROM item_general_formulaciones WHERE item_general_id = ?`;
+    const grpBind: unknown[] = [fromId];
+    if (scope) { grpSql += ` AND formulaciones_id IN (${scope.map(() => '?').join(',')})`; grpBind.push(...scope); }
+    grpSql += ' GROUP BY formulaciones_id';
+    return m.query(grpSql, grpBind);
+  }
+
+  private async fetchSnapshotReemplazo(
+    m: EntityManager,
+    fromId: number,
+    toId: number,
+    afectadasIds: number[],
+  ): Promise<Record<string, unknown>[]> {
+    if (!afectadasIds.length) return [];
+    const ph = afectadasIds.map(() => '?').join(',');
+    return m.query(
+      `SELECT formulaciones_id, item_general_id, cantidad, porcentaje
+         FROM item_general_formulaciones WHERE item_general_id IN (?, ?) AND formulaciones_id IN (${ph})`,
+      [fromId, toId, ...afectadasIds],
+    );
+  }
+
+  private async aplicarReemplazoEnFormulas(
+    m: EntityManager,
+    formulas: Record<string, unknown>[],
+    fromId: number,
+    toId: number,
+  ): Promise<{ consolidadas: number; repuntadas: number }> {
+    let consolidadas = 0;
+    let repuntadas = 0;
+    for (const f of formulas) {
+      const fid = Number(f.formulaciones_id);
+      const sumC = Number(f.sc);
+      const sumP = Number(f.sp);
+      await m.query(`DELETE FROM item_general_formulaciones WHERE formulaciones_id = ? AND item_general_id = ?`, [fid, fromId]);
+      const bRow = (await m.query(
+        `SELECT id_item_general_formulaciones, cantidad, porcentaje FROM item_general_formulaciones
+          WHERE formulaciones_id = ? AND item_general_id = ? ORDER BY id_item_general_formulaciones ASC LIMIT 1`,
+        [fid, toId],
+      ))[0];
+      if (bRow) {
+        await m.query(
+          `UPDATE item_general_formulaciones SET cantidad = ?, porcentaje = ? WHERE id_item_general_formulaciones = ?`,
+          [Number(bRow.cantidad) + sumC, Number(bRow.porcentaje) + sumP, bRow.id_item_general_formulaciones],
+        );
+        consolidadas++;
+      } else {
+        await m.query(
+          `INSERT INTO item_general_formulaciones (formulaciones_id, item_general_id, cantidad, porcentaje) VALUES (?, ?, ?, ?)`,
+          [fid, toId, sumC, sumP],
+        );
+        repuntadas++;
+      }
+    }
+    return { consolidadas, repuntadas };
+  }
+
+  private async evaluarEliminacionOrigen(
+    m: EntityManager,
+    fromId: number,
+  ): Promise<{ usoRestante: number; stockActivo: number; aEliminada: boolean }> {
+    const usoRestante = Number(
+      (await m.query(`SELECT COUNT(*) AS c FROM item_general_formulaciones WHERE item_general_id = ?`, [fromId]))[0].c,
+    );
+    const stockActivo = Number(
+      (await m.query(
+        `SELECT COUNT(*) AS c FROM inventario_capas WHERE item_general_id = ? AND estado = 1 AND cantidad_disponible > 0`,
+        [fromId],
+      ))[0].c,
+    );
+    let aEliminada = false;
+    if (usoRestante === 0 && stockActivo === 0) {
+      await m.query(`UPDATE item_general SET deleted_at = NOW() WHERE id_item_general = ?`, [fromId]);
+      aEliminada = true;
+    }
+    return { usoRestante, stockActivo, aEliminada };
+  }
+
+  private async registrarLogReemplazo(
+    m: EntityManager,
+    params: {
+      fromId: number; toId: number; fromNombre: unknown; toNombre: unknown;
+      afectadasIds: number[]; consolidadas: number; repuntadas: number;
+      aEliminada: boolean; snapshot: Record<string, unknown>[]; usuario: string;
+    },
+  ): Promise<number | null> {
+    const { fromId, toId, fromNombre, toNombre, afectadasIds, consolidadas, repuntadas, aEliminada, snapshot, usuario } = params;
+    if (!afectadasIds.length) return null;
+    const res: { insertId: number } = await m.query(
+      `INSERT INTO item_reemplazo_log
+         (from_item_id, to_item_id, from_nombre, to_nombre, formulas_afectadas, origen_eliminada, snapshot, usuario, revertido, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NOW())`,
+      [
+        fromId, toId, String(fromNombre ?? '').slice(0, 150), String(toNombre ?? '').slice(0, 150),
+        consolidadas + repuntadas, aEliminada ? 1 : 0, JSON.stringify(snapshot), String(usuario).slice(0, 100),
+      ],
+    );
+    return res.insertId;
+  }
+
   // POST /sincronizacion/reemplazar-formula
   async reemplazarEnFormulas(
     fromId: number,
@@ -1037,92 +1161,21 @@ export class SincronizacionService {
     formulacionIds: unknown[] | null,
     usuario: string,
   ): Promise<Record<string, unknown>> {
-    if (fromId === toId) throw this.fail('La materia origen y la de reemplazo no pueden ser la misma.', 422);
-    const from = (await this.dataSource.query(`SELECT nombre FROM item_general WHERE id_item_general = ?`, [fromId]))[0];
-    const to = (await this.dataSource.query(`SELECT nombre FROM item_general WHERE id_item_general = ?`, [toId]))[0];
-    if (!from) throw this.fail('La materia origen no existe.', 422);
-    if (!to) throw this.fail('La materia de reemplazo no existe.', 422);
-
-    let scope: number[] | null = null;
-    if (Array.isArray(formulacionIds) && formulacionIds.length) {
-      scope = [...new Set(formulacionIds.map((x) => Math.trunc(Number(x))).filter((x) => x > 0))];
-      if (!scope.length) scope = null;
-    }
+    const { from, to } = await this.validarItemsReemplazo(fromId, toId);
+    const scope = this.resolverScopeFormulaciones(formulacionIds);
 
     return this.dataSource.transaction(async (m) => {
-      let grpSql = `SELECT formulaciones_id, SUM(cantidad) AS sc, SUM(porcentaje) AS sp
-                      FROM item_general_formulaciones WHERE item_general_id = ?`;
-      const grpBind: unknown[] = [fromId];
-      if (scope) { grpSql += ` AND formulaciones_id IN (${scope.map(() => '?').join(',')})`; grpBind.push(...scope); }
-      grpSql += ' GROUP BY formulaciones_id';
-      const formulas: Record<string, unknown>[] = await m.query(grpSql, grpBind);
-
+      const formulas = await this.fetchFormulasAgrupadasPorMp(m, fromId, scope);
       const afectadasIds = formulas.map((f) => Number(f.formulaciones_id));
-      let snapshot: Record<string, unknown>[] = [];
-      if (afectadasIds.length) {
-        const ph = afectadasIds.map(() => '?').join(',');
-        snapshot = await m.query(
-          `SELECT formulaciones_id, item_general_id, cantidad, porcentaje
-             FROM item_general_formulaciones WHERE item_general_id IN (?, ?) AND formulaciones_id IN (${ph})`,
-          [fromId, toId, ...afectadasIds],
-        );
-      }
+      const snapshot = await this.fetchSnapshotReemplazo(m, fromId, toId, afectadasIds);
 
-      let consolidadas = 0;
-      let repuntadas = 0;
-      for (const f of formulas) {
-        const fid = Number(f.formulaciones_id);
-        const sumC = Number(f.sc);
-        const sumP = Number(f.sp);
-        await m.query(`DELETE FROM item_general_formulaciones WHERE formulaciones_id = ? AND item_general_id = ?`, [fid, fromId]);
-        const bRow = (await m.query(
-          `SELECT id_item_general_formulaciones, cantidad, porcentaje FROM item_general_formulaciones
-            WHERE formulaciones_id = ? AND item_general_id = ? ORDER BY id_item_general_formulaciones ASC LIMIT 1`,
-          [fid, toId],
-        ))[0];
-        if (bRow) {
-          await m.query(
-            `UPDATE item_general_formulaciones SET cantidad = ?, porcentaje = ? WHERE id_item_general_formulaciones = ?`,
-            [Number(bRow.cantidad) + sumC, Number(bRow.porcentaje) + sumP, bRow.id_item_general_formulaciones],
-          );
-          consolidadas++;
-        } else {
-          await m.query(
-            `INSERT INTO item_general_formulaciones (formulaciones_id, item_general_id, cantidad, porcentaje) VALUES (?, ?, ?, ?)`,
-            [fid, toId, sumC, sumP],
-          );
-          repuntadas++;
-        }
-      }
+      const { consolidadas, repuntadas } = await this.aplicarReemplazoEnFormulas(m, formulas, fromId, toId);
+      const { usoRestante, stockActivo, aEliminada } = await this.evaluarEliminacionOrigen(m, fromId);
 
-      const usoRestante = Number(
-        (await m.query(`SELECT COUNT(*) AS c FROM item_general_formulaciones WHERE item_general_id = ?`, [fromId]))[0].c,
-      );
-      const stockActivo = Number(
-        (await m.query(
-          `SELECT COUNT(*) AS c FROM inventario_capas WHERE item_general_id = ? AND estado = 1 AND cantidad_disponible > 0`,
-          [fromId],
-        ))[0].c,
-      );
-      let aEliminada = false;
-      if (usoRestante === 0 && stockActivo === 0) {
-        await m.query(`UPDATE item_general SET deleted_at = NOW() WHERE id_item_general = ?`, [fromId]);
-        aEliminada = true;
-      }
-
-      let logId: number | null = null;
-      if (afectadasIds.length) {
-        const res: { insertId: number } = await m.query(
-          `INSERT INTO item_reemplazo_log
-             (from_item_id, to_item_id, from_nombre, to_nombre, formulas_afectadas, origen_eliminada, snapshot, usuario, revertido, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NOW())`,
-          [
-            fromId, toId, String(from.nombre ?? '').slice(0, 150), String(to.nombre ?? '').slice(0, 150),
-            consolidadas + repuntadas, aEliminada ? 1 : 0, JSON.stringify(snapshot), String(usuario).slice(0, 100),
-          ],
-        );
-        logId = res.insertId;
-      }
+      const logId = await this.registrarLogReemplazo(m, {
+        fromId, toId, fromNombre: from.nombre, toNombre: to.nombre,
+        afectadasIds, consolidadas, repuntadas, aEliminada, snapshot, usuario,
+      });
 
       return {
         ok: true, log_id: logId, consolidadas, repuntadas,
