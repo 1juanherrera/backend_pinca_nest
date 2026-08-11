@@ -250,110 +250,144 @@ export class ItemService {
   }
 
   // ── PUT /item_general/:id ── update_full_item
+  private async actualizarItemGeneralCore(
+    m: import('typeorm').EntityManager,
+    id: number,
+    data: Record<string, unknown>,
+  ): Promise<void> {
+    const tipoRaw = data.tipo;
+    const tipo = tipoRaw != null && !Number.isNaN(Number(tipoRaw)) && String(tipoRaw).trim() !== ''
+      ? Math.trunc(Number(tipoRaw))
+      : this.tipoMap(tipoRaw);
+
+    await m.query(
+      `UPDATE item_general SET nombre=?, codigo=?, tipo=?, categoria_id=?, viscosidad=?, p_g=?, color=?,
+              brillo_60=?, secado=?, cubrimiento=?, molienda=?, ph=?, poder_tintoreo=?, unidad_id=?
+        WHERE id_item_general=?`,
+      [
+        data.nombre, String(data.codigo ?? '').slice(0, 10), tipo, data.categoria_id ?? null,
+        data.viscosidad ?? null, data.p_g ?? null, data.color ?? null, data.brillo_60 ?? null,
+        data.secado ?? null, data.cubrimiento ?? null, data.molienda ?? null, data.ph ?? null,
+        data.poder_tintoreo ?? null, data.unidad_id ?? null, id,
+      ],
+    );
+  }
+
+  private async actualizarCostosItem(
+    m: import('typeorm').EntityManager,
+    id: number,
+    data: Record<string, unknown>,
+  ): Promise<void> {
+    const existsCostos = Number(
+      (await m.query(`SELECT COUNT(*) AS n FROM costos_item WHERE item_general_id = ?`, [id]))[0].n,
+    );
+    // Columnas de costo permitidas (whitelist). Sólo se actualizan las que
+    // vienen REALMENTE en el body: antes se usaba `data.x ?? 0` para todas, así
+    // que un PUT parcial que no reenviaba `costo_unitario` lo pisaba con 0
+    // (destruyendo el promedio ponderado que mantiene el motor de capas) y
+    // `volumen` con 1. Ahora las ausentes quedan intactas; `costo_unitario`
+    // sólo se toca si el body lo envía explícitamente.
+    const COST_COLS = [
+      'costo_unitario', 'envase', 'etiqueta', 'plastico',
+      'volumen', 'costo_cunete', 'costo_tambor',
+    ] as const;
+    if (existsCostos > 0) {
+      const present = COST_COLS.filter((c) => data[c] !== undefined);
+      if (present.length > 0) {
+        const setSql = present.map((c) => `${c}=?`).join(', ');
+        await m.query(
+          `UPDATE costos_item SET ${setSql}, fecha_calculo=CURDATE() WHERE item_general_id=?`,
+          [...present.map((c) => data[c]), id],
+        );
+      }
+    } else {
+      // Ítem nuevo sin fila de costos: se siembra una fila completa con defaults.
+      const costos = [
+        data.costo_unitario ?? 0, data.envase ?? 0, data.etiqueta ?? 0, data.plastico ?? 0,
+        data.volumen ?? 1, data.costo_cunete ?? 0, data.costo_tambor ?? 0,
+      ];
+      await m.query(
+        `INSERT INTO costos_item (costo_unitario, envase, etiqueta, plastico, volumen, fecha_calculo,
+                costo_cunete, costo_tambor, item_general_id)
+         VALUES (?, ?, ?, ?, ?, CURDATE(), ?, ?, ?)`,
+        [...costos, id],
+      );
+    }
+  }
+
+  private async actualizarInventarioSiCorresponde(
+    m: import('typeorm').EntityManager,
+    id: number,
+    data: Record<string, unknown>,
+  ): Promise<void> {
+    if (data.cantidad === undefined || data.bodega_id === undefined) return;
+    const res: { affectedRows: number } = await m.query(
+      `UPDATE inventario SET cantidad=? WHERE item_general_id=? AND bodegas_id=?`,
+      [Number(data.cantidad), id, Number(data.bodega_id)],
+    );
+    if (res.affectedRows === 0) {
+      const check = (await m.query(
+        `SELECT id_inventario FROM inventario WHERE item_general_id=? AND bodegas_id=?`,
+        [id, Number(data.bodega_id)],
+      ))[0];
+      if (!check) {
+        await m.query(
+          `INSERT INTO inventario (item_general_id, bodegas_id, cantidad, estado, tipo) VALUES (?, ?, ?, 0, 1)`,
+          [id, Number(data.bodega_id), Number(data.cantidad)],
+        );
+      }
+    }
+  }
+
+  private async resolverFormulacionParaItem(
+    m: import('typeorm').EntityManager,
+    id: number,
+    data: Record<string, unknown>,
+  ): Promise<number> {
+    const formRow = (await m.query(`SELECT id_formulaciones FROM formulaciones WHERE item_general_id = ?`, [id]))[0];
+    if (formRow) {
+      const idForm = Number(formRow.id_formulaciones);
+      if (data.descripcion_formula !== undefined) {
+        await m.query(`UPDATE formulaciones SET descripcion=? WHERE id_formulaciones=?`, [data.descripcion_formula, idForm]);
+      }
+      return idForm;
+    }
+    const insF: { insertId: number } = await m.query(
+      `INSERT INTO formulaciones (nombre, item_general_id, estado, defecto) VALUES (?, ?, 1, 1)`,
+      [`Formulación - ${data.nombre}`, id],
+    );
+    return insF.insertId;
+  }
+
+  private async reemplazarDetalleFormulacionSiViene(
+    m: import('typeorm').EntityManager,
+    idForm: number,
+    data: Record<string, unknown>,
+  ): Promise<void> {
+    if (data.formulaciones === undefined) return;
+    await m.query(`DELETE FROM item_general_formulaciones WHERE formulaciones_id = ?`, [idForm]);
+    const detalle = (data.formulaciones as Record<string, unknown>[]).filter((f) => f.materia_prima_id);
+    for (const f of detalle) {
+      await m.query(
+        `INSERT INTO item_general_formulaciones (formulaciones_id, item_general_id, cantidad, porcentaje)
+         VALUES (?, ?, ?, ?)`,
+        [idForm, f.materia_prima_id, f.cantidad ?? 0, f.porcentaje ?? 0],
+      );
+    }
+  }
+
   async update(id: number, data: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (!id) throw this.fail('ID no proporcionado', 400);
     await this.dataSource.transaction(async (m) => {
       const existing = (await m.query(`SELECT id_item_general FROM item_general WHERE id_item_general = ?`, [id]))[0];
       if (!existing) throw this.fail('El item no existe.', 400);
 
-      const tipoRaw = data.tipo;
-      const tipo = tipoRaw != null && !Number.isNaN(Number(tipoRaw)) && String(tipoRaw).trim() !== ''
-        ? Math.trunc(Number(tipoRaw))
-        : this.tipoMap(tipoRaw);
+      await this.actualizarItemGeneralCore(m, id, data);
+      await this.actualizarCostosItem(m, id, data);
+      await this.actualizarInventarioSiCorresponde(m, id, data);
 
-      await m.query(
-        `UPDATE item_general SET nombre=?, codigo=?, tipo=?, categoria_id=?, viscosidad=?, p_g=?, color=?,
-                brillo_60=?, secado=?, cubrimiento=?, molienda=?, ph=?, poder_tintoreo=?, unidad_id=?
-          WHERE id_item_general=?`,
-        [
-          data.nombre, String(data.codigo ?? '').slice(0, 10), tipo, data.categoria_id ?? null,
-          data.viscosidad ?? null, data.p_g ?? null, data.color ?? null, data.brillo_60 ?? null,
-          data.secado ?? null, data.cubrimiento ?? null, data.molienda ?? null, data.ph ?? null,
-          data.poder_tintoreo ?? null, data.unidad_id ?? null, id,
-        ],
-      );
-
-      const existsCostos = Number(
-        (await m.query(`SELECT COUNT(*) AS n FROM costos_item WHERE item_general_id = ?`, [id]))[0].n,
-      );
-      // Columnas de costo permitidas (whitelist). Sólo se actualizan las que
-      // vienen REALMENTE en el body: antes se usaba `data.x ?? 0` para todas, así
-      // que un PUT parcial que no reenviaba `costo_unitario` lo pisaba con 0
-      // (destruyendo el promedio ponderado que mantiene el motor de capas) y
-      // `volumen` con 1. Ahora las ausentes quedan intactas; `costo_unitario`
-      // sólo se toca si el body lo envía explícitamente.
-      const COST_COLS = [
-        'costo_unitario', 'envase', 'etiqueta', 'plastico',
-        'volumen', 'costo_cunete', 'costo_tambor',
-      ] as const;
-      if (existsCostos > 0) {
-        const present = COST_COLS.filter((c) => data[c] !== undefined);
-        if (present.length > 0) {
-          const setSql = present.map((c) => `${c}=?`).join(', ');
-          await m.query(
-            `UPDATE costos_item SET ${setSql}, fecha_calculo=CURDATE() WHERE item_general_id=?`,
-            [...present.map((c) => data[c]), id],
-          );
-        }
-      } else {
-        // Ítem nuevo sin fila de costos: se siembra una fila completa con defaults.
-        const costos = [
-          data.costo_unitario ?? 0, data.envase ?? 0, data.etiqueta ?? 0, data.plastico ?? 0,
-          data.volumen ?? 1, data.costo_cunete ?? 0, data.costo_tambor ?? 0,
-        ];
-        await m.query(
-          `INSERT INTO costos_item (costo_unitario, envase, etiqueta, plastico, volumen, fecha_calculo,
-                  costo_cunete, costo_tambor, item_general_id)
-           VALUES (?, ?, ?, ?, ?, CURDATE(), ?, ?, ?)`,
-          [...costos, id],
-        );
-      }
-
-      if (data.cantidad !== undefined && data.bodega_id !== undefined) {
-        const res: { affectedRows: number } = await m.query(
-          `UPDATE inventario SET cantidad=? WHERE item_general_id=? AND bodegas_id=?`,
-          [Number(data.cantidad), id, Number(data.bodega_id)],
-        );
-        if (res.affectedRows === 0) {
-          const check = (await m.query(
-            `SELECT id_inventario FROM inventario WHERE item_general_id=? AND bodegas_id=?`,
-            [id, Number(data.bodega_id)],
-          ))[0];
-          if (!check) {
-            await m.query(
-              `INSERT INTO inventario (item_general_id, bodegas_id, cantidad, estado, tipo) VALUES (?, ?, ?, 0, 1)`,
-              [id, Number(data.bodega_id), Number(data.cantidad)],
-            );
-          }
-        }
-      }
-
-      const formRow = (await m.query(`SELECT id_formulaciones FROM formulaciones WHERE item_general_id = ?`, [id]))[0];
-      let idForm: number;
-      if (formRow) {
-        idForm = Number(formRow.id_formulaciones);
-        if (data.descripcion_formula !== undefined) {
-          await m.query(`UPDATE formulaciones SET descripcion=? WHERE id_formulaciones=?`, [data.descripcion_formula, idForm]);
-        }
-      } else {
-        const insF: { insertId: number } = await m.query(
-          `INSERT INTO formulaciones (nombre, item_general_id, estado, defecto) VALUES (?, ?, 1, 1)`,
-          [`Formulación - ${data.nombre}`, id],
-        );
-        idForm = insF.insertId;
-      }
-
-      if (data.formulaciones !== undefined) {
-        await m.query(`DELETE FROM item_general_formulaciones WHERE formulaciones_id = ?`, [idForm]);
-        const detalle = (data.formulaciones as Record<string, unknown>[]).filter((f) => f.materia_prima_id);
-        for (const f of detalle) {
-          await m.query(
-            `INSERT INTO item_general_formulaciones (formulaciones_id, item_general_id, cantidad, porcentaje)
-             VALUES (?, ?, ?, ?)`,
-            [idForm, f.materia_prima_id, f.cantidad ?? 0, f.porcentaje ?? 0],
-          );
-        }
-      }
+      const idForm = await this.resolverFormulacionParaItem(m, id, data);
+      await this.reemplazarDetalleFormulacionSiViene(m, idForm, data);
     });
 
     return { status: 200, message: `Item ${id} y sus dependencias actualizados correctamente` };
