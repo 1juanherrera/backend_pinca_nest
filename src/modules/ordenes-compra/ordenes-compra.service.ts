@@ -562,19 +562,11 @@ export class OrdenesCompraService {
     return { lote };
   }
 
-  // ── POST /ordenes_compra/:id/recibir-prorrateado ──
-  async recibirLoteProrrateado(
-    idOrden: number,
+  private validarBodyProrrateo(
     body: Record<string, unknown>,
-    username: string,
-  ): Promise<Record<string, unknown>> {
-    const orden = await this.detalle(idOrden); // 404 si no existe
-    if (orden.estado !== 'Enviada') {
-      throw new BadRequestException('Solo se pueden recibir líneas de órdenes Enviadas.');
-    }
+  ): { precioPagado: number; loteProvBody: string | null; lineasPayload: Record<string, unknown>[] } {
     const vErr = (errors: Record<string, string>) =>
       new UnprocessableEntityException({ msg: 'Datos inválidos', errors });
-
     const precioPagado = Number(body?.precio_total_pagado ?? 0);
     const loteProvBody = (body?.lote_proveedor as string) ?? null;
     const lineasPayload = (body?.lineas as Record<string, unknown>[]) ?? [];
@@ -582,7 +574,15 @@ export class OrdenesCompraService {
     if (!Array.isArray(lineasPayload) || lineasPayload.length < 2) {
       throw vErr({ lineas: 'El prorrateo necesita al menos 2 líneas.' });
     }
+    return { precioPagado, loteProvBody, lineasPayload };
+  }
 
+  private prepararLineasProrrateo(
+    orden: Record<string, unknown>,
+    lineasPayload: Record<string, unknown>[],
+  ): { preparadas: { idDetalle: number; linea: Record<string, unknown>; cantRec: number }[]; valorListaTotal: number } {
+    const vErr = (errors: Record<string, string>) =>
+      new UnprocessableEntityException({ msg: 'Datos inválidos', errors });
     const lineasPorId = new Map<number, Record<string, unknown>>();
     for (const l of orden.lineas as Record<string, unknown>[]) lineasPorId.set(Number(l.id_detalle), l);
 
@@ -603,6 +603,105 @@ export class OrdenesCompraService {
       preparadas.push({ idDetalle, linea, cantRec });
     }
     if (valorListaTotal <= 0) throw vErr({ lineas: 'La suma del valor de lista debe ser mayor a 0.' });
+    return { preparadas, valorListaTotal };
+  }
+
+  private async relockCabeceraOcEnviada(m: EntityManager, idOrden: number): Promise<void> {
+    const cab = (await m.query(
+      `SELECT estado FROM ordenes_compra WHERE id_orden = ? AND deleted_at IS NULL FOR UPDATE`,
+      [idOrden],
+    )) as Array<{ estado: string }>;
+    if (!cab[0] || cab[0].estado !== 'Enviada') {
+      throw new BadRequestException(
+        `La orden ya no está 'Enviada' (estado: ${cab[0]?.estado ?? 'inexistente'}) — recargá la orden.`,
+      );
+    }
+  }
+
+  private async procesarLineaProrrateada(
+    m: EntityManager,
+    params: {
+      idOrden: number; idDetalle: number; linea: Record<string, unknown>; cantRec: number;
+      orden: Record<string, unknown>; bodegaId: number; loteProveedor: string;
+      factor: number; valorListaTotal: number; precioPagado: number; username: string;
+    },
+  ): Promise<void> {
+    const { idOrden, idDetalle, linea, cantRec, orden, bodegaId, loteProveedor, factor, valorListaTotal, precioPagado, username } = params;
+    const lock = (await m.query(
+      `SELECT recibido_en, cantidad, cantidad_recibida FROM ordenes_compra_detalle WHERE id_detalle = ? FOR UPDATE`,
+      [idDetalle],
+    ))[0];
+    if (!lock) throw new BadRequestException(`Línea ${idDetalle} desapareció durante la transacción.`);
+    if (lock.recibido_en) throw new BadRequestException(`Otro usuario recibió la línea ${idDetalle} antes — recargá la orden.`);
+    const cantidadAcumulada = Number(lock.cantidad_recibida ?? 0) + cantRec;
+    const pedidoActual = Number(lock.cantidad);
+    if (cantidadAcumulada > pedidoActual + 0.0001) {
+      throw new BadRequestException(`Línea ${idDetalle}: la cantidad acumulada supera el pedido tras lock.`);
+    }
+    const completa = cantidadAcumulada >= pedidoActual - 0.0001;
+    await m.query(
+      `UPDATE ordenes_compra_detalle SET cantidad_recibida = ?, recibido_en = ${completa ? 'NOW()' : 'NULL'} WHERE id_detalle = ?`,
+      [cantidadAcumulada, idDetalle],
+    );
+
+    if (!linea.item_general_id) return;
+    const itemGeneralId = Number(linea.item_general_id);
+    const itemProv = linea.item_proveedor_id
+      ? (await m.query(`SELECT * FROM item_proveedor WHERE id_item_proveedor = ?`, [Number(linea.item_proveedor_id)]))[0]
+      : null;
+    const factorConversion = Math.max(Number(itemProv?.factor_conversion) || 1, 0.001);
+    const cantidadBase = cantRec * factorConversion;
+    const precioUnitProrrateado = Number(linea.precio_unit) * factor;
+    const costoUnitarioKg = precioUnitProrrateado / factorConversion;
+
+    await this.capas.crearCapa(m, {
+      item_general_id: itemGeneralId, bodegas_id: bodegaId,
+      proveedor_id: orden.proveedor_id ? Number(orden.proveedor_id) : null,
+      item_proveedor_id: linea.item_proveedor_id ? Number(linea.item_proveedor_id) : null,
+      orden_compra_id: idOrden, cantidad_original: cantidadBase, cantidad_disponible: cantidadBase,
+      costo_unitario: costoUnitarioKg,
+      unidad_compra_id: itemProv?.unidad_compra_id != null ? Number(itemProv.unidad_compra_id) : null,
+      factor_conversion: factorConversion, precio_compra: precioUnitProrrateado, lote_proveedor: loteProveedor,
+    });
+    await this.capas.ingresarABodega(m, itemGeneralId, bodegaId, cantidadBase);
+    const promedio = await this.capas.recalcularPromedioPonderado(m, itemGeneralId);
+    await m.query(`UPDATE item_general SET costo_produccion = ? WHERE id_item_general = ?`, [promedio, itemGeneralId]);
+    await this.capas.registrarMovimiento(m, {
+      tipo: MOV.TIPO_ENTRADA, item_general_id: itemGeneralId, bodega_id: bodegaId, cantidad: cantidadBase,
+      referencia_tipo: MOV.REF_OC, referencia_id: idOrden,
+      descripcion: `Recepción lote prorrateado OC #${orden.numero} línea ${idDetalle}`,
+      costo_unitario: costoUnitarioKg, responsable: username,
+      metadata: {
+        numero_oc: orden.numero ?? null, proveedor_id: orden.proveedor_id ?? null,
+        item_proveedor_id: linea.item_proveedor_id ?? null, cantidad_recibida: cantRec,
+        unidad_compra: itemProv?.unidad_compra_id ?? null, factor_conversion: factorConversion,
+        precio_unit_original: Number(linea.precio_unit), precio_unit_prorrateado: precioUnitProrrateado,
+        factor_prorrateo: factor, valor_lista_total_lote: valorListaTotal,
+        precio_pagado_lote: precioPagado, lote_proveedor: loteProveedor,
+      },
+    });
+  }
+
+  private async finalizarOcSiCompleta(m: EntityManager, idOrden: number): Promise<void> {
+    const pend = Number(
+      (await m.query(`SELECT COUNT(*) AS n FROM ordenes_compra_detalle WHERE ordenes_compra_id = ? AND recibido_en IS NULL`, [idOrden]))[0].n,
+    );
+    if (pend === 0) await m.query(`UPDATE ordenes_compra SET estado = 'Recibida' WHERE id_orden = ?`, [idOrden]);
+  }
+
+  // ── POST /ordenes_compra/:id/recibir-prorrateado ──
+  async recibirLoteProrrateado(
+    idOrden: number,
+    body: Record<string, unknown>,
+    username: string,
+  ): Promise<Record<string, unknown>> {
+    const orden = await this.detalle(idOrden); // 404 si no existe
+    if (orden.estado !== 'Enviada') {
+      throw new BadRequestException('Solo se pueden recibir líneas de órdenes Enviadas.');
+    }
+
+    const { precioPagado, loteProvBody, lineasPayload } = this.validarBodyProrrateo(body);
+    const { preparadas, valorListaTotal } = this.prepararLineasProrrateo(orden, lineasPayload);
 
     const factor = precioPagado / valorListaTotal;
     const bodegaId = Number(orden.bodegas_id);
@@ -610,76 +709,16 @@ export class OrdenesCompraService {
 
     await this.dataSource.transaction(async (m) => {
       // Re-lock + re-valida la cabecera OC (igual que recibirLinea).
-      const cab = (await m.query(
-        `SELECT estado FROM ordenes_compra WHERE id_orden = ? AND deleted_at IS NULL FOR UPDATE`,
-        [idOrden],
-      )) as Array<{ estado: string }>;
-      if (!cab[0] || cab[0].estado !== 'Enviada') {
-        throw new BadRequestException(
-          `La orden ya no está 'Enviada' (estado: ${cab[0]?.estado ?? 'inexistente'}) — recargá la orden.`,
-        );
-      }
+      await this.relockCabeceraOcEnviada(m, idOrden);
 
       const loteProveedor = await this.capas.resolverLoteProveedor(m, idOrden, loteProvBody);
       for (const { idDetalle, linea, cantRec } of preparadas) {
-        const lock = (await m.query(
-          `SELECT recibido_en, cantidad, cantidad_recibida FROM ordenes_compra_detalle WHERE id_detalle = ? FOR UPDATE`,
-          [idDetalle],
-        ))[0];
-        if (!lock) throw new BadRequestException(`Línea ${idDetalle} desapareció durante la transacción.`);
-        if (lock.recibido_en) throw new BadRequestException(`Otro usuario recibió la línea ${idDetalle} antes — recargá la orden.`);
-        const cantidadAcumulada = Number(lock.cantidad_recibida ?? 0) + cantRec;
-        const pedidoActual = Number(lock.cantidad);
-        if (cantidadAcumulada > pedidoActual + 0.0001) {
-          throw new BadRequestException(`Línea ${idDetalle}: la cantidad acumulada supera el pedido tras lock.`);
-        }
-        const completa = cantidadAcumulada >= pedidoActual - 0.0001;
-        await m.query(
-          `UPDATE ordenes_compra_detalle SET cantidad_recibida = ?, recibido_en = ${completa ? 'NOW()' : 'NULL'} WHERE id_detalle = ?`,
-          [cantidadAcumulada, idDetalle],
-        );
-
-        if (!linea.item_general_id) continue;
-        const itemGeneralId = Number(linea.item_general_id);
-        const itemProv = linea.item_proveedor_id
-          ? (await m.query(`SELECT * FROM item_proveedor WHERE id_item_proveedor = ?`, [Number(linea.item_proveedor_id)]))[0]
-          : null;
-        const factorConversion = Math.max(Number(itemProv?.factor_conversion) || 1, 0.001);
-        const cantidadBase = cantRec * factorConversion;
-        const precioUnitProrrateado = Number(linea.precio_unit) * factor;
-        const costoUnitarioKg = precioUnitProrrateado / factorConversion;
-
-        await this.capas.crearCapa(m, {
-          item_general_id: itemGeneralId, bodegas_id: bodegaId,
-          proveedor_id: orden.proveedor_id ? Number(orden.proveedor_id) : null,
-          item_proveedor_id: linea.item_proveedor_id ? Number(linea.item_proveedor_id) : null,
-          orden_compra_id: idOrden, cantidad_original: cantidadBase, cantidad_disponible: cantidadBase,
-          costo_unitario: costoUnitarioKg,
-          unidad_compra_id: itemProv?.unidad_compra_id != null ? Number(itemProv.unidad_compra_id) : null,
-          factor_conversion: factorConversion, precio_compra: precioUnitProrrateado, lote_proveedor: loteProveedor,
-        });
-        await this.capas.ingresarABodega(m, itemGeneralId, bodegaId, cantidadBase);
-        const promedio = await this.capas.recalcularPromedioPonderado(m, itemGeneralId);
-        await m.query(`UPDATE item_general SET costo_produccion = ? WHERE id_item_general = ?`, [promedio, itemGeneralId]);
-        await this.capas.registrarMovimiento(m, {
-          tipo: MOV.TIPO_ENTRADA, item_general_id: itemGeneralId, bodega_id: bodegaId, cantidad: cantidadBase,
-          referencia_tipo: MOV.REF_OC, referencia_id: idOrden,
-          descripcion: `Recepción lote prorrateado OC #${orden.numero} línea ${idDetalle}`,
-          costo_unitario: costoUnitarioKg, responsable: username,
-          metadata: {
-            numero_oc: orden.numero ?? null, proveedor_id: orden.proveedor_id ?? null,
-            item_proveedor_id: linea.item_proveedor_id ?? null, cantidad_recibida: cantRec,
-            unidad_compra: itemProv?.unidad_compra_id ?? null, factor_conversion: factorConversion,
-            precio_unit_original: Number(linea.precio_unit), precio_unit_prorrateado: precioUnitProrrateado,
-            factor_prorrateo: factor, valor_lista_total_lote: valorListaTotal,
-            precio_pagado_lote: precioPagado, lote_proveedor: loteProveedor,
-          },
+        await this.procesarLineaProrrateada(m, {
+          idOrden, idDetalle, linea, cantRec, orden, bodegaId, loteProveedor,
+          factor, valorListaTotal, precioPagado, username,
         });
       }
-      const pend = Number(
-        (await m.query(`SELECT COUNT(*) AS n FROM ordenes_compra_detalle WHERE ordenes_compra_id = ? AND recibido_en IS NULL`, [idOrden]))[0].n,
-      );
-      if (pend === 0) await m.query(`UPDATE ordenes_compra SET estado = 'Recibida' WHERE id_orden = ?`, [idOrden]);
+      await this.finalizarOcSiCompleta(m, idOrden);
     });
 
     return {
