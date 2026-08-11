@@ -317,16 +317,23 @@ export class FormulacionesCostosService {
   }
 
   // ── calculate_costs_by_proveedor (GET formulaciones/costos/:id/proveedor/:pid) ──
-  async calculateCostsByProveedor(itemId: number, proveedorId: number): Promise<Record<string, unknown>> {
-    const margenDef = await this.margenDefault();
+  private async fetchProveedorPorId(proveedorId: number): Promise<Record<string, unknown>> {
     const proveedor = (await this.dataSource.query(
       `SELECT id_proveedor, nombre_empresa, nombre_encargado FROM proveedor WHERE id_proveedor = ?`, [proveedorId],
     ))[0];
     if (!proveedor) throw this.fail(`Proveedor con ID ${proveedorId} no encontrado.`);
+    return proveedor;
+  }
+
+  private async fetchFormulacionIdActiva(itemId: number): Promise<number> {
     const formRow = (await this.dataSource.query(
       `SELECT id_formulaciones FROM formulaciones WHERE item_general_id = ? AND estado = 1 LIMIT 1`, [itemId],
     ))[0];
     if (!formRow) throw this.fail('El item no tiene una formulación activa.');
+    return formRow.id_formulaciones;
+  }
+
+  private async fetchItemConCostosDefault(itemId: number, margenDef: number): Promise<Record<string, unknown>> {
     const item = (await this.dataSource.query(
       `SELECT ig.id_item_general, ig.nombre, ig.codigo, COALESCE(NULLIF(ci.volumen,0),1) AS volumen_base,
               COALESCE(ci.envase,0) AS envase, COALESCE(ci.etiqueta,0) AS etiqueta, COALESCE(ci.bandeja,0) AS bandeja,
@@ -336,7 +343,10 @@ export class FormulacionesCostosService {
         WHERE ig.id_item_general = ?`, [itemId],
     ))[0];
     if (!item) throw this.fail(`Item con ID ${itemId} no encontrado.`);
+    return item;
+  }
 
+  private async fetchIngredientesConCostoEstandar(formulacionId: number): Promise<Record<string, unknown>[]> {
     const formulaciones: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT igf.id_item_general_formulaciones, igf.item_general_id, igf.formulaciones_id, igf.cantidad,
               ig.nombre AS materia_prima_nombre, ig.codigo AS materia_prima_codigo,
@@ -348,15 +358,48 @@ export class FormulacionesCostosService {
          INNER JOIN item_general ig ON igf.item_general_id = ig.id_item_general
          LEFT JOIN costos_item ci ON ig.id_item_general = ci.item_general_id
          LEFT JOIN inventario i ON ig.id_item_general = i.item_general_id
-        WHERE igf.formulaciones_id = ? ORDER BY ig.nombre ASC`, [formRow.id_formulaciones],
+        WHERE igf.formulaciones_id = ? ORDER BY ig.nombre ASC`, [formulacionId],
     );
     if (!formulaciones.length) throw this.fail('La formulación no tiene materias primas asignadas.');
+    return formulaciones;
+  }
 
-    const itemsProveedor: Record<string, unknown>[] = await this.dataSource.query(
+  private async fetchItemsDelProveedor(proveedorId: number): Promise<Record<string, unknown>[]> {
+    return this.dataSource.query(
       `SELECT ip.*, uc.nombre AS unidad_compra_nombre FROM item_proveedor ip
          LEFT JOIN unidad uc ON uc.id_unidad = ip.unidad_compra_id
         WHERE ip.proveedor_id = ? AND ip.disponible = 1`, [proveedorId],
     );
+  }
+
+  private encontrarMejorItemProveedor(
+    mpNombre: unknown,
+    mpId: number,
+    itemsProveedor: Record<string, unknown>[],
+  ): Record<string, unknown> | null {
+    let bestMatch: Record<string, unknown> | null = null;
+    let bestPriority = 999;
+    for (const ip of itemsProveedor) {
+      let priority = 999;
+      if (ip.item_general_id && N(ip.item_general_id) === mpId) priority = 1;
+      else { const nm = matchNombre(mpNombre, ip.nombre); if (nm === 1) priority = 2; else if (nm === 2) priority = 3; }
+      if (priority < bestPriority) { bestMatch = ip; bestPriority = priority; }
+      else if (priority === bestPriority && bestMatch && priority < 999) {
+        const bf = Math.max(Number(bestMatch.factor_conversion) || 1, 0.001);
+        const ipf = Math.max(Number(ip.factor_conversion) || 1, 0.001);
+        if (N(ip.precio_unitario) / ipf < N(bestMatch.precio_unitario) / bf) bestMatch = ip;
+      }
+    }
+    return bestMatch;
+  }
+
+  async calculateCostsByProveedor(itemId: number, proveedorId: number): Promise<Record<string, unknown>> {
+    const margenDef = await this.margenDefault();
+    const proveedor = await this.fetchProveedorPorId(proveedorId);
+    const formulacionId = await this.fetchFormulacionIdActiva(itemId);
+    const item = await this.fetchItemConCostosDefault(itemId, margenDef);
+    const formulaciones = await this.fetchIngredientesConCostoEstandar(formulacionId);
+    const itemsProveedor = await this.fetchItemsDelProveedor(proveedorId);
 
     let totalMPProveedor = 0;
     let totalMPEstandar = 0;
@@ -366,19 +409,7 @@ export class FormulacionesCostosService {
       const mpNombre = row.materia_prima_nombre;
       const mpId = N(row.item_general_id);
 
-      let bestMatch: Record<string, unknown> | null = null;
-      let bestPriority = 999;
-      for (const ip of itemsProveedor) {
-        let priority = 999;
-        if (ip.item_general_id && N(ip.item_general_id) === mpId) priority = 1;
-        else { const nm = matchNombre(mpNombre, ip.nombre); if (nm === 1) priority = 2; else if (nm === 2) priority = 3; }
-        if (priority < bestPriority) { bestMatch = ip; bestPriority = priority; }
-        else if (priority === bestPriority && bestMatch && priority < 999) {
-          const bf = Math.max(Number(bestMatch.factor_conversion) || 1, 0.001);
-          const ipf = Math.max(Number(ip.factor_conversion) || 1, 0.001);
-          if (N(ip.precio_unitario) / ipf < N(bestMatch.precio_unitario) / bf) bestMatch = ip;
-        }
-      }
+      const bestMatch = this.encontrarMejorItemProveedor(mpNombre, mpId, itemsProveedor);
 
       let costoProveedor: number | null = null;
       let precioProvRaw: number | null = null;
