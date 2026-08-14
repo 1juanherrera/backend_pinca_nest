@@ -4,10 +4,11 @@ Backups completos (esquema + datos + rutinas/triggers/eventos) de la base de dat
 
 ## Archivos
 
+Se conserva **solo el backup más reciente** — cada uno reemplaza por completo al anterior (contiene todos los datos, no es incremental), así que los viejos se borran al generar uno nuevo.
+
 | Archivo | Fecha | Notas |
 |---|---|---|
-| `gestorpincadb_2026-07-27.sql` | 2026-07-27 | Snapshot post-migración CI4→NestJS. |
-| `gestorpincadb_2026-07-31.sql` | 2026-07-31 | 58/58 tablas, incluye datos + rutinas/triggers/eventos. Generado con `mysqldump --single-transaction --routines --triggers --events`. |
+| `gestorpincadb_2026-08-14.sql` | 2026-08-14 | 58/58 tablas, incluye datos + rutinas/triggers/eventos. Generado con `mysqldump --single-transaction --routines --triggers --events`. |
 
 ## Cómo se generó
 
@@ -27,13 +28,13 @@ Necesitás un MySQL 8 corriendo (por ejemplo, el mismo stack Docker `pinca-erp` 
 mysql -uroot -p -e "CREATE DATABASE IF NOT EXISTS gestorpincadb CHARACTER SET utf8mb4;"
 
 # Importar
-mysql -uroot -p gestorpincadb < gestorpincadb_2026-07-31.sql
+mysql -uroot -p gestorpincadb < gestorpincadb_2026-08-14.sql
 ```
 
 Si estás usando el Docker del proyecto:
 
 ```bash
-docker exec -i pinca-erp-db mysql -uroot -ppassword gestorpincadb < gestorpincadb_2026-07-31.sql
+docker exec -i pinca-erp-db mysql -uroot -ppassword gestorpincadb < gestorpincadb_2026-08-14.sql
 ```
 
 ## Credenciales de referencia (sandbox/dev, ver `.env` del backend para las reales)
