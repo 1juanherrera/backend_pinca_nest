@@ -1,3 +1,7 @@
+---
+aliases:
+  - README db-backup
+---
 # db-backup — PINCA ERP
 
 Backups completos (esquema + datos + rutinas/triggers/eventos) de la base de datos `gestorpincadb` del stack `pinca-erp` (NestJS unificado). A diferencia de la carpeta `backups/` (gitignored, snapshots de trabajo intermedios pre-migración/pre-cambios de schema), **`db-backup/` SÍ se commitea** — es la carpeta convenida para poder clonar el repo en otra máquina y traer la data completa junto con el código.

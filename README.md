@@ -1,3 +1,7 @@
+---
+aliases:
+  - README Backend
+---
 # PINCA Backend — NestJS (migración desde CodeIgniter 4)
 
 Migración incremental (*strangler fig*) del backend de PINCA de **CodeIgniter 4 (PHP)** a **NestJS 11 (TypeScript)**. NestJS y CI4 conviven detrás del mismo proxy, apuntando a la **misma base MySQL**, y se migran módulos uno a uno sin downtime.
