@@ -69,6 +69,8 @@ services:
       # Tirilla ESC/POS por red — impresora térmica del cliente (ver §7 CLAUDE.md).
       PRINTER_IP: ${PRINTER_IP:-}
       PRINTER_PORT: ${PRINTER_PORT:-9100}
+      # Asistente IA — bot WhatsApp (n8n). API key para autenticar requests externos.
+      ASISTENTE_API_KEY: ${ASISTENTE_API_KEY:-}
       # Nest sirve el SPA desde acá (Opción A). El dist se monta abajo.
       FRONTEND_DIST: /usr/src/app/frontend-dist
     volumes:

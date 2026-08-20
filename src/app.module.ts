@@ -45,6 +45,7 @@ import { BodegaInventarioModule } from './modules/bodega-inventario/bodega-inven
 import { FormulacionesCostosModule } from './modules/formulaciones-costos/formulaciones-costos.module';
 import { NominaModule } from './modules/nomina/nomina.module';
 import { FacturacionElectronicaModule } from './modules/facturacion-electronica/facturacion-electronica.module';
+import { AsistenteModule } from './modules/asistente/asistente.module';
 
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { VisorReadonlyGuard } from './common/guards/visor-readonly.guard';
@@ -134,6 +135,9 @@ import { HealthController } from './health.controller';
     // Facturación electrónica DIAN (Factus, EN EVALUACIÓN — aislado, no toca `facturas`
     // ni ningún otro módulo real todavía; admin-only, harness de prueba):
     FacturacionElectronicaModule,
+    // Asistente IA — bot de WhatsApp para consultas de formulaciones/proveedores
+    // (público con API key, no JWT — pensado para n8n):
+    AsistenteModule,
   ],
   controllers: [HealthController],
   providers: [
