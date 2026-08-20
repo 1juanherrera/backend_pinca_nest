@@ -22,3 +22,6 @@
 * [[pinca_backend_nest/templates/plantilla_endpoint|Plantilla: Endpoint NestJS]]
 * [[pinca_backend_nest/templates/plantilla_componente|Plantilla: Componente Frontend]]
 
+## ⚙️ Configuración local
+* [[pinca_backend_nest/docs/CONFIG_OBSIDIAN|Config Obsidian (grupos de color, ajustes no versionados)]]
+
