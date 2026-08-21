@@ -5,7 +5,10 @@ repo del ERP (`PROYECTO_PINCA`) un plan por fases para extender `pinca_backend_n
 soportar la tienda pública. Ver [contexto-proyecto.md](./contexto-proyecto.md) para el
 contexto completo detrás de este prompt.
 
-Estado: entregado, plan aún pendiente de revisar.
+Estado: **superado** — el plan se ejecutó y se descartó a favor de un Core API separado.
+Ver [arquitectura-core-api.md](./arquitectura-core-api.md) para la arquitectura vigente y
+[revision-plan-extension.md](./revision-plan-extension.md) para la revisión completa de
+este prompt contra el estado actual (2026-08-20).
 
 ---
 
