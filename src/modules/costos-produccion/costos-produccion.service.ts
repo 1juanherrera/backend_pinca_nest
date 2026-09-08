@@ -111,7 +111,8 @@ export class CostosProduccionService {
   /** Productos con fórmula activa (tipo=0, no borrado) + agregados de costos_item. */
   private async fetchProductosConFormula(margenDef: number): Promise<Record<string, unknown>[]> {
     return this.dataSource.query(
-      `SELECT ig.id_item_general, ig.nombre, ig.codigo, ig.precio_venta_manual, ig.precio_manual_activo,
+      `SELECT ig.id_item_general, ig.nombre, ig.codigo, ig.descripcion, ig.precio_venta_manual, ig.precio_manual_activo,
+              ig.viscosidad, ig.color, ig.brillo_60, ig.secado, ig.cubrimiento, ig.molienda, ig.ph, ig.poder_tintoreo, ig.p_g,
               cat.nombre AS categoria_nombre, f.id_formulaciones,
               COALESCE(NULLIF(ci.volumen,0),1) AS volumen_base,
               COALESCE(ci.envase,0) AS envase, COALESCE(ci.etiqueta,0) AS etiqueta,
@@ -137,6 +138,22 @@ export class CostosProduccionService {
         WHERE igf.formulaciones_id IN (${phF}) ORDER BY igf.formulaciones_id, ig.nombre`,
       formIds,
     );
+  }
+
+  /** Costo interno (costos_item.costo_unitario > 0) por MP — cubre AGUA, pastas e insumos internos. */
+  private async fetchCostosInternos(mpIds: number[]): Promise<Map<number, number>> {
+    const map = new Map<number, number>();
+    if (!mpIds.length) return map;
+    const ph = mpIds.map(() => '?').join(',');
+    const rows: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT item_general_id, COALESCE(costo_unitario, 0) AS cu FROM costos_item WHERE item_general_id IN (${ph})`,
+      mpIds,
+    );
+    for (const r of rows) {
+      const cu = N(r.cu);
+      if (cu > 0) map.set(N(r.item_general_id), cu);
+    }
+    return map;
   }
 
   /** Stock disponible (Σ inventario_capas activas) por materia prima. */
@@ -212,6 +229,7 @@ export class CostosProduccionService {
     mps: Record<string, unknown>[],
     stockPorMp: Map<number, number>,
     proveedoresPorMp: Map<number, Record<string, unknown>[]>,
+    costosInternos: Map<number, number>,
   ): Promise<Record<string, unknown>> {
     const faltantes: Record<string, unknown>[] = [];
     const proveedoresUsados = new Map<number, Record<string, unknown>>();
@@ -233,15 +251,18 @@ export class CostosProduccionService {
           };
         }
       }
-      const esAgua = upperTrim(mp.mp_nombre) === 'AGUA';
       const opciones = proveedoresPorMp.get(mpId) ?? [];
-      if (mp.mp_deleted || (!opciones.length && !esAgua)) {
-        faltantes.push({ id: mpId, nombre: mp.mp_nombre, codigo: mp.mp_codigo, motivo: mp.mp_deleted ? 'archivado' : 'sin_proveedor' });
+      if (mp.mp_deleted) {
+        faltantes.push({ id: mpId, nombre: mp.mp_nombre, codigo: mp.mp_codigo, motivo: 'archivado' });
         continue;
       }
-      if (esAgua && !opciones.length) {
-        const cu = N((await this.dataSource.query(`SELECT COALESCE(costo_unitario,0) AS cu FROM costos_item WHERE item_general_id = ?`, [mpId]))[0]?.cu);
-        costoMpTotal += cantidad * cu;
+      if (!opciones.length) {
+        const ci = costosInternos.get(mpId);
+        if (ci !== undefined) {
+          costoMpTotal += cantidad * ci;
+          continue;
+        }
+        faltantes.push({ id: mpId, nombre: mp.mp_nombre, codigo: mp.mp_codigo, motivo: 'sin_proveedor' });
         continue;
       }
       const opcion = opciones[0];
@@ -266,8 +287,11 @@ export class CostosProduccionService {
     const galonesPosibles = tandasPosibles * vol;
 
     return {
-      id_item_general: N(p.id_item_general), nombre: p.nombre, codigo: p.codigo,
+      id_item_general: N(p.id_item_general), nombre: p.nombre, codigo: p.codigo, descripcion: p.descripcion ?? null,
       categoria_nombre: p.categoria_nombre, volumen_base: vol, estado,
+      viscosidad: p.viscosidad ?? null, color: p.color ?? null, brillo_60: p.brillo_60 ?? null,
+      secado: p.secado ?? null, cubrimiento: p.cubrimiento ?? null, molienda: p.molienda ?? null,
+      ph: p.ph ?? null, poder_tintoreo: p.poder_tintoreo ?? null, p_g: p.p_g ?? null,
       mps_total: mps.length, mps_faltantes: faltantes,
       tandas_posibles: tandasPosibles, galones_posibles: galonesPosibles, cuello_botella: cuello,
       costo_mp_total: estado === 'completo' ? round(costoMpTotal, 2) : null,
@@ -285,17 +309,16 @@ export class CostosProduccionService {
     };
   }
 
-  /** % de materias primas con al menos un proveedor disponible (o AGUA, que no lo necesita). */
+  /** % de materias primas cubiertas (proveedor o costo interno). */
   private calcularCobertura(
     mpIds: number[],
-    mpsPorId: Map<number, { nombre: unknown; codigo: unknown }>,
     proveedoresPorMp: Map<number, Record<string, unknown>[]>,
+    costosInternos: Map<number, number>,
   ): Record<string, unknown> {
     const totalMps = mpIds.length;
     let cubiertasMps = 0;
     for (const mid of mpIds) {
-      const esAgua = upperTrim(mpsPorId.get(mid)?.nombre) === 'AGUA';
-      if ((proveedoresPorMp.get(mid)?.length ?? 0) > 0 || esAgua) cubiertasMps++;
+      if ((proveedoresPorMp.get(mid)?.length ?? 0) > 0 || costosInternos.has(mid)) cubiertasMps++;
     }
     return {
       mps_totales: totalMps, mps_cubiertas: cubiertasMps, mps_sin_proveedor: totalMps - cubiertasMps,
@@ -316,8 +339,11 @@ export class CostosProduccionService {
     const mpsPorId = new Map<number, { nombre: unknown; codigo: unknown }>();
     for (const i of ingredientes) mpsPorId.set(N(i.mp_id), { nombre: i.mp_nombre, codigo: i.mp_codigo });
 
-    const stockPorMp = await this.fetchStockPorMp(mpIds);
-    const proveedoresPorMp = await this.fetchProveedoresPorMp(mpIds, mpsPorId);
+    const [stockPorMp, proveedoresPorMp, costosInternos] = await Promise.all([
+      this.fetchStockPorMp(mpIds),
+      this.fetchProveedoresPorMp(mpIds, mpsPorId),
+      this.fetchCostosInternos(mpIds),
+    ]);
 
     const ingredientesPorForm = new Map<number, Record<string, unknown>[]>();
     for (const i of ingredientes) {
@@ -330,12 +356,12 @@ export class CostosProduccionService {
     for (const p of productos) {
       const formId = N(p.id_formulaciones);
       const mps = ingredientesPorForm.get(formId) ?? [];
-      resultado.push(await this.calcularCostoProducto(p, mps, stockPorMp, proveedoresPorMp));
+      resultado.push(await this.calcularCostoProducto(p, mps, stockPorMp, proveedoresPorMp, costosInternos));
     }
 
     return {
       productos: resultado,
-      cobertura: this.calcularCobertura(mpIds, mpsPorId, proveedoresPorMp),
+      cobertura: this.calcularCobertura(mpIds, proveedoresPorMp, costosInternos),
     };
   }
 
@@ -363,6 +389,7 @@ export class CostosProduccionService {
     const mpIds = [...new Set(ingredientes.map((i) => N(i.mp_id)))];
     const mpsPorId = new Map<number, { nombre: unknown }>();
     for (const i of ingredientes) mpsPorId.set(N(i.mp_id), { nombre: i.mp_nombre });
+    const costosInternos = await this.fetchCostosInternos(mpIds);
 
     const proveedoresPorMp = new Map<number, Record<string, unknown>[]>();
     if (mpIds.length) {
@@ -408,18 +435,19 @@ export class CostosProduccionService {
       const cantidad = N(mp.cantidad);
       const opciones = proveedoresPorMp.get(mpId) ?? [];
       const mejor = opciones[0] ?? null;
-      const esAgua = upperTrim(mp.mp_nombre) === 'AGUA';
 
-      if (esAgua && !opciones.length) {
-        const cu = N((await this.dataSource.query(`SELECT COALESCE(costo_unitario,0) AS cu FROM costos_item WHERE item_general_id = ?`, [mpId]))[0]?.cu);
-        detalle.push({
-          mp_id: mpId, nombre: mp.mp_nombre, codigo: mp.mp_codigo, archivado: false,
-          cantidad_kg: cantidad, porcentaje: N(mp.porcentaje), proveedor_id: null,
-          proveedor_nombre: 'Costo interno', item_proveedor_id: null, item_proveedor_nombre: null,
-          unidad_compra: null, factor_conversion: null, precio_unitario: cu, precio_por_kg: cu,
-          subtotal: round(cantidad * cu, 2), total_opciones: 0, costo_interno: true,
-        });
-        continue;
+      if (!opciones.length) {
+        const ci = costosInternos.get(mpId);
+        if (ci !== undefined) {
+          detalle.push({
+            mp_id: mpId, nombre: mp.mp_nombre, codigo: mp.mp_codigo, archivado: false,
+            cantidad_kg: cantidad, porcentaje: N(mp.porcentaje), proveedor_id: null,
+            proveedor_nombre: 'Costo interno', item_proveedor_id: null, item_proveedor_nombre: null,
+            unidad_compra: null, factor_conversion: null, precio_unitario: ci, precio_por_kg: ci,
+            subtotal: round(cantidad * ci, 2), total_opciones: 0, costo_interno: true,
+          });
+          continue;
+        }
       }
       detalle.push({
         mp_id: mpId, nombre: mp.mp_nombre, codigo: mp.mp_codigo, archivado: !!mp.mp_deleted,

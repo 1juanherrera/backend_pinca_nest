@@ -32,6 +32,7 @@ export class ClientesService {
     if (dto.direccion !== undefined) out.direccion = dto.direccion;
     if (dto.ciudad !== undefined) out.ciudad = dto.ciudad;
     if (dto.plazo_pago !== undefined) out.plazo_pago = dto.plazo_pago;
+    if (dto.dias_pago !== undefined) out.dias_pago = dto.dias_pago;
     if (dto.telefono !== undefined) out.telefono = dto.telefono;
     if (dto.email !== undefined) out.email = dto.email;
     if (dto.tipo !== undefined) out.tipo = dto.tipo;

@@ -32,6 +32,9 @@ export class Cliente {
   @Column({ type: 'int', nullable: true, default: 30 })
   plazo_pago: number | null;
 
+  @Column({ type: 'varchar', length: 100, nullable: true })
+  dias_pago: string | null;
+
   @Column({ type: 'bigint', nullable: true })
   telefono: string | null;
 

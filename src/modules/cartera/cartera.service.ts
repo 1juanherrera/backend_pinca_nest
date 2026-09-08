@@ -85,6 +85,77 @@ export class CarteraService {
     return { grupos, total_mora };
   }
 
+  async clientesPorCiudad(): Promise<Record<string, unknown>[]> {
+    const rows: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT c.id_clientes, c.nombre_empresa, c.nombre_encargado,
+              COALESCE(NULLIF(TRIM(c.ciudad),''), 'Sin ciudad') AS ciudad,
+              c.tipo, c.telefono, c.email, c.plazo_pago, c.dias_pago,
+              COUNT(DISTINCT f.id_facturas) AS total_facturas,
+              COALESCE(SUM(f.saldo_pendiente), 0) AS saldo_total,
+              COUNT(DISTINCT CASE
+                WHEN f.fecha_vencimiento < CURDATE()
+                 AND f.estado IN ${ESTADOS}
+                THEN f.id_facturas END) AS facturas_vencidas,
+              COALESCE(SUM(CASE
+                WHEN f.fecha_vencimiento < CURDATE()
+                 AND f.estado IN ${ESTADOS}
+                THEN f.saldo_pendiente ELSE 0 END), 0) AS saldo_vencido
+         FROM clientes c
+         LEFT JOIN facturas f
+           ON f.cliente_id = c.id_clientes
+          AND f.deleted_at IS NULL
+          AND f.estado IN ${ESTADOS}
+        WHERE c.deleted_at IS NULL
+        GROUP BY c.id_clientes
+       HAVING total_facturas > 0
+        ORDER BY ciudad, c.nombre_empresa`,
+    );
+    return rows;
+  }
+
+  async crearSaldoInicial(dto: {
+    cliente_id: number;
+    total: number;
+    observaciones?: string;
+    fecha_emision?: string;
+    fecha_vencimiento?: string;
+  }): Promise<Record<string, unknown>> {
+    if (!dto.cliente_id) throw new BadRequestException('Cliente requerido');
+    if (!dto.total || dto.total <= 0) throw new BadRequestException('El monto debe ser mayor a 0');
+
+    const cliRows: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT id_clientes FROM clientes WHERE id_clientes = ? AND deleted_at IS NULL`,
+      [dto.cliente_id],
+    );
+    if (!cliRows.length) throw new NotFoundException('Cliente no encontrado');
+
+    const [{ seq }]: [{ seq: number }] = await this.dataSource.query(
+      `SELECT COUNT(*) + 1 AS seq FROM facturas WHERE numero LIKE 'SI-%'`,
+    );
+    const numero = `SI-${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`;
+
+    const fechaEmision = dto.fecha_emision || new Date().toISOString().slice(0, 10);
+    const fechaVencimiento = dto.fecha_vencimiento || null;
+
+    const result = await this.dataSource.query(
+      `INSERT INTO facturas
+         (numero, cliente_id, fecha_emision, fecha_vencimiento, subtotal, descuento, impuestos, retencion, total, saldo_pendiente, observaciones, estado)
+       VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, 'Pendiente')`,
+      [numero, dto.cliente_id, fechaEmision, fechaVencimiento, dto.total, dto.total, dto.total, dto.observaciones || null],
+    );
+
+    return {
+      id_facturas: result.insertId,
+      numero,
+      cliente_id: dto.cliente_id,
+      total: dto.total,
+      saldo_pendiente: dto.total,
+      fecha_emision: fechaEmision,
+      fecha_vencimiento: fechaVencimiento,
+      estado: 'Pendiente',
+    };
+  }
+
   async estadoCuenta(clienteId: number): Promise<Record<string, unknown>> {
     if (!clienteId) throw new BadRequestException('ID de cliente no proporcionado');
     const cliRows: Record<string, unknown>[] = await this.dataSource.query(

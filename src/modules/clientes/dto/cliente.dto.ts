@@ -47,6 +47,9 @@ export class CreateClienteDto {
   @IsOptional() @IsInt() @Min(0) @Max(365)
   plazo_pago?: number;
 
+  @IsOptional() @IsString() @MaxLength(100)
+  dias_pago?: string;
+
   @IsOptional() @IsInt() @IsIn([1, 2, 3])
   tipo?: number;
 
@@ -81,6 +84,9 @@ export class UpdateClienteDto {
 
   @IsOptional() @IsInt() @Min(0) @Max(365)
   plazo_pago?: number;
+
+  @IsOptional() @IsString() @MaxLength(100)
+  dias_pago?: string;
 
   @IsOptional() @IsInt() @IsIn([1, 2, 3])
   tipo?: number;

@@ -136,6 +136,10 @@ export class FormulacionesCostosService {
     return { totalMateriaPrima, totalCantidad };
   }
 
+  private async ivaPct(): Promise<number> {
+    return N(await this.cfg.obtener('iva_default', 19));
+  }
+
   // ── calculate_costs (GET formulaciones/costos/:id) ──
   async calculateCosts(itemId: number, newVolume: number | null = null): Promise<Record<string, unknown>> {
     if (!itemId) throw this.fail('Parámetro inválido: itemId requerido.');
@@ -155,6 +159,9 @@ export class FormulacionesCostosService {
     const margen = N(item.porcentaje_utilidad);
     const precioVenta = margen > 0 ? nuevoCostoTotal * (1 + margen / 100) : nuevoCostoTotal;
     const costoMgKg = newVolume && newVolume > 0 ? nuevoCostoMateriaPrima / newVolume : totalMateriaPrima / (volumenBase > 0 ? volumenBase : 1);
+
+    const iva = await this.ivaPct();
+    const ivaFactor = iva / 100;
 
     const formateadas = formulaciones.map((r) => ({
       ...r,
@@ -180,6 +187,12 @@ export class FormulacionesCostosService {
         plastico: toCOP(item.plastico), costo_mod: toCOP(item.costo_mod), costo_mp_kg: toCOP(costoMgKg),
         porcentaje_utilidad: margen, total_cantidad_materia_prima: toThousands(totalCantidad),
         total: toCOP(nuevoCostoTotal), precio_venta: toCOP(precioVenta),
+        iva_porcentaje: iva,
+        total_sin_iva: toCOP(nuevoCostoTotal),
+        iva_valor: toCOP(nuevoCostoTotal * ivaFactor),
+        total_con_iva: toCOP(nuevoCostoTotal * (1 + ivaFactor)),
+        precio_venta_sin_iva: toCOP(precioVenta),
+        precio_venta_con_iva: toCOP(precioVenta * (1 + ivaFactor)),
         fecha_calculo: formulaciones[0].fecha_calculo ?? null,
       },
       formulaciones: formateadas,
@@ -478,6 +491,9 @@ export class FormulacionesCostosService {
     const costoMPKg = volumen > 0 ? totalMPProveedor / volumen : 0;
     const diferenciaMPTotal = totalMPProveedor - totalMPEstandar;
 
+    const iva = await this.ivaPct();
+    const ivaFactor = iva / 100;
+
     return {
       proveedor: { id_proveedor: N(proveedor.id_proveedor), nombre_empresa: proveedor.nombre_empresa, nombre_encargado: proveedor.nombre_encargado },
       costos_proveedor: {
@@ -485,6 +501,12 @@ export class FormulacionesCostosService {
         envase: toCOP(item.envase), etiqueta: toCOP(item.etiqueta), bandeja: toCOP(item.bandeja),
         plastico: toCOP(item.plastico), costo_mod: toCOP(item.costo_mod), porcentaje_utilidad: margen,
         total: toCOP(nuevoCostoTotal), precio_venta: toCOP(precioVenta),
+        iva_porcentaje: iva,
+        total_sin_iva: toCOP(nuevoCostoTotal),
+        iva_valor: toCOP(nuevoCostoTotal * ivaFactor),
+        total_con_iva: toCOP(nuevoCostoTotal * (1 + ivaFactor)),
+        precio_venta_sin_iva: toCOP(precioVenta),
+        precio_venta_con_iva: toCOP(precioVenta * (1 + ivaFactor)),
       },
       diferencia: {
         total_mp: toCOP(Math.abs(diferenciaMPTotal)), es_mas_caro: diferenciaMPTotal > 0,
