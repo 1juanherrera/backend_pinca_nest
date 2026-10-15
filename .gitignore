@@ -26,3 +26,4 @@ npm-debug.log*
 # entidades autogeneradas para revisión (typeorm-model-generator)
 /src/_generated_entities
 backups/
+db-backup/
