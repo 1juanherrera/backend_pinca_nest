@@ -89,7 +89,7 @@ export class CarteraService {
     const rows: Record<string, unknown>[] = await this.dataSource.query(
       `SELECT c.id_clientes, c.nombre_empresa, c.nombre_encargado,
               COALESCE(NULLIF(TRIM(c.ciudad),''), 'Sin ciudad') AS ciudad,
-              c.tipo, c.telefono, c.email, c.plazo_pago, c.dias_pago,
+              c.tipo, c.telefono, c.email, c.plazo_pago,
               COUNT(DISTINCT f.id_facturas) AS total_facturas,
               COALESCE(SUM(f.saldo_pendiente), 0) AS saldo_total,
               COUNT(DISTINCT CASE
@@ -154,6 +154,222 @@ export class CarteraService {
       fecha_vencimiento: fechaVencimiento,
       estado: 'Pendiente',
     };
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  CUENTAS POR PAGAR (proveedores / órdenes de compra)
+  // ═══════════════════════════════════════════════════════════════
+
+  private static readonly OC_PENDIENTES = "('Enviada','Recibida')";
+
+  async resumenPagar(): Promise<Record<string, unknown>> {
+    const total_por_pagar = await this.scalar(
+      `SELECT COALESCE(SUM(total),0) AS v FROM ordenes_compra
+        WHERE estado IN ${CarteraService.OC_PENDIENTES} AND deleted_at IS NULL`,
+    );
+    const ocs_pendientes = await this.scalar(
+      `SELECT COUNT(*) AS v FROM ordenes_compra
+        WHERE estado IN ${CarteraService.OC_PENDIENTES} AND deleted_at IS NULL`,
+    );
+    const ocs_recibidas_sin_pagar = await this.scalar(
+      `SELECT COALESCE(SUM(total),0) AS v FROM ordenes_compra
+        WHERE estado = 'Recibida' AND deleted_at IS NULL`,
+    );
+    const proveedores_con_deuda = await this.scalar(
+      `SELECT COUNT(DISTINCT proveedor_id) AS v FROM ordenes_compra
+        WHERE estado IN ${CarteraService.OC_PENDIENTES} AND deleted_at IS NULL`,
+    );
+    const oc_mas_antigua: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT oc.numero, oc.fecha, DATEDIFF(CURDATE(), oc.fecha) AS dias
+         FROM ordenes_compra oc
+        WHERE oc.estado IN ${CarteraService.OC_PENDIENTES} AND oc.deleted_at IS NULL
+        ORDER BY oc.fecha ASC LIMIT 1`,
+    );
+    return {
+      total_por_pagar,
+      ocs_pendientes,
+      ocs_recibidas_sin_pagar,
+      proveedores_con_deuda,
+      oc_mas_antigua: oc_mas_antigua[0] ?? null,
+    };
+  }
+
+  async agingPagar(): Promise<Record<string, unknown>> {
+    const warning = Number(await this.cfg.obtener('mora_warning_dias', 30));
+    const critica = Number(await this.cfg.obtener('mora_critica_dias', 60));
+
+    const rows: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT oc.id_orden AS id_ordenes_compra, oc.numero, oc.proveedor_id, oc.total,
+              oc.fecha, oc.estado,
+              p.nombre_empresa, p.nombre_encargado, p.numero_documento,
+              DATEDIFF(CURDATE(), oc.fecha) AS dias_antiguedad
+         FROM ordenes_compra oc
+         LEFT JOIN proveedor p ON p.id_proveedor = oc.proveedor_id
+        WHERE oc.estado IN ${CarteraService.OC_PENDIENTES}
+          AND oc.deleted_at IS NULL
+        ORDER BY dias_antiguedad DESC`,
+    );
+
+    const grupos: Record<string, { label: string; monto: number; ordenes: Record<string, unknown>[] }> = {
+      reciente:    { label: 'Reciente', monto: 0, ordenes: [] },
+      dias_1_30:   { label: `1 – ${warning} días`, monto: 0, ordenes: [] },
+      dias_31_60:  { label: `${warning + 1} – ${critica} días`, monto: 0, ordenes: [] },
+      dias_60_mas: { label: `Más de ${critica}`, monto: 0, ordenes: [] },
+    };
+
+    for (const oc of rows) {
+      const dias = Number(oc.dias_antiguedad);
+      const key =
+        dias <= 0 ? 'reciente' : dias <= warning ? 'dias_1_30' : dias <= critica ? 'dias_31_60' : 'dias_60_mas';
+      grupos[key].monto += Number(oc.total);
+      grupos[key].ordenes.push(oc);
+    }
+
+    const total_antiguo =
+      grupos.dias_1_30.monto + grupos.dias_31_60.monto + grupos.dias_60_mas.monto;
+    return { grupos, total_antiguo };
+  }
+
+  async proveedoresPorPagar(): Promise<Record<string, unknown>[]> {
+    const rows: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT p.id_proveedor AS id_proveedores, p.nombre_empresa, p.nombre_encargado,
+              p.numero_documento, p.telefono, p.email,
+              COUNT(DISTINCT oc.id_orden) AS total_ocs,
+              COALESCE(SUM(oc.total), 0) AS saldo_total,
+              COUNT(DISTINCT CASE WHEN oc.estado = 'Recibida' THEN oc.id_orden END) AS ocs_recibidas,
+              COALESCE(SUM(CASE WHEN oc.estado = 'Recibida' THEN oc.total ELSE 0 END), 0) AS saldo_recibido,
+              MIN(oc.fecha) AS oc_mas_antigua
+         FROM proveedor p
+         INNER JOIN ordenes_compra oc
+           ON oc.proveedor_id = p.id_proveedor
+          AND oc.deleted_at IS NULL
+          AND oc.estado IN ${CarteraService.OC_PENDIENTES}
+        WHERE p.deleted_at IS NULL
+        GROUP BY p.id_proveedor
+        ORDER BY saldo_total DESC`,
+    );
+    return rows;
+  }
+
+  async estadoCuentaProveedor(proveedorId: number): Promise<Record<string, unknown>> {
+    if (!proveedorId) throw new BadRequestException('ID de proveedor no proporcionado');
+    const provRows: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT * FROM proveedor WHERE id_proveedor = ? AND deleted_at IS NULL`,
+      [proveedorId],
+    );
+    if (!provRows.length) {
+      throw new NotFoundException(`Proveedor con ID ${proveedorId} no encontrado.`);
+    }
+    const ordenes: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT oc.*,
+              p.nombre_empresa AS proveedor_nombre,
+              COALESCE(pag.total_pagado, 0) AS total_pagado_oc,
+              oc.total - COALESCE(pag.total_pagado, 0) AS saldo_pendiente_oc
+         FROM ordenes_compra oc
+         LEFT JOIN proveedor p ON p.id_proveedor = oc.proveedor_id
+         LEFT JOIN (
+           SELECT orden_id, SUM(monto) AS total_pagado
+             FROM pagos_proveedor
+            GROUP BY orden_id
+         ) pag ON pag.orden_id = oc.id_orden
+        WHERE oc.proveedor_id = ? AND oc.deleted_at IS NULL
+        ORDER BY oc.fecha DESC`,
+      [proveedorId],
+    );
+    const pagos: Record<string, unknown>[] = await this.dataSource.query(
+      `SELECT pp.*
+         FROM pagos_proveedor pp
+         INNER JOIN ordenes_compra oc ON oc.id_orden = pp.orden_id
+        WHERE oc.proveedor_id = ? AND oc.deleted_at IS NULL
+        ORDER BY pp.fecha_pago DESC`,
+      [proveedorId],
+    );
+    const total_deuda = ordenes
+      .filter((oc) => oc.estado === 'Enviada' || oc.estado === 'Recibida')
+      .reduce((a, oc) => a + Number(oc.saldo_pendiente_oc ?? oc.total), 0);
+    const total_pagado = pagos.reduce((a, p) => a + Number(p.monto), 0);
+    return {
+      proveedor: provRows[0],
+      ordenes,
+      pagos,
+      total_deuda,
+      total_pagado,
+    };
+  }
+
+  async registrarPagoProveedor(dto: {
+    orden_id: number;
+    proveedor_id: number;
+    monto: number;
+    tipo: string;
+    metodo_pago: string;
+    fecha_pago: string;
+    numero_referencia?: string;
+    observaciones?: string;
+  }): Promise<Record<string, unknown>> {
+    if (!dto.orden_id) throw new BadRequestException('Orden de compra requerida');
+    if (!dto.monto || dto.monto <= 0) throw new BadRequestException('El monto debe ser mayor a 0');
+    if (!dto.metodo_pago) throw new BadRequestException('Método de pago requerido');
+
+    return this.dataSource.transaction(async (manager) => {
+      const [oc]: Record<string, unknown>[] = await manager.query(
+        `SELECT oc.id_orden, oc.total, oc.estado, oc.proveedor_id
+           FROM ordenes_compra oc
+          WHERE oc.id_orden = ? AND oc.deleted_at IS NULL
+          FOR UPDATE`,
+        [dto.orden_id],
+      );
+      if (!oc) throw new NotFoundException('Orden de compra no encontrada');
+      if (oc.estado === 'Pagada') throw new BadRequestException('Esta orden ya está pagada');
+      if (oc.estado === 'Borrador' || oc.estado === 'Cancelada') {
+        throw new BadRequestException(`No se puede pagar una orden en estado ${oc.estado}`);
+      }
+
+      const [{ pagado }]: [{ pagado: string }] = await manager.query(
+        `SELECT COALESCE(SUM(monto), 0) AS pagado FROM pagos_proveedor WHERE orden_id = ?`,
+        [dto.orden_id],
+      );
+      const saldo = Number(oc.total) - Number(pagado);
+      if (dto.monto > saldo + 0.01) {
+        throw new BadRequestException(`El monto ($${dto.monto}) supera el saldo pendiente ($${saldo.toFixed(2)})`);
+      }
+
+      const result = await manager.query(
+        `INSERT INTO pagos_proveedor
+           (orden_id, proveedor_id, fecha_pago, monto, metodo_pago, tipo, numero_referencia, observaciones)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          dto.orden_id,
+          dto.proveedor_id || oc.proveedor_id,
+          dto.fecha_pago || new Date().toISOString().slice(0, 10),
+          dto.monto,
+          dto.metodo_pago,
+          dto.tipo || 'pago_total',
+          dto.numero_referencia || null,
+          dto.observaciones || null,
+        ],
+      );
+
+      const nuevoSaldo = saldo - dto.monto;
+      if (nuevoSaldo <= 0.01) {
+        await manager.query(
+          `UPDATE ordenes_compra SET estado = 'Pagada' WHERE id_orden = ?`,
+          [dto.orden_id],
+        );
+      }
+
+      return {
+        id_pago_proveedor: result.insertId,
+        orden_id: dto.orden_id,
+        proveedor_id: dto.proveedor_id || oc.proveedor_id,
+        monto: dto.monto,
+        tipo: dto.tipo || 'pago_total',
+        metodo_pago: dto.metodo_pago,
+        fecha_pago: dto.fecha_pago,
+        saldo_restante: Math.max(nuevoSaldo, 0),
+        estado_oc: nuevoSaldo <= 0.01 ? 'Pagada' : oc.estado,
+      };
+    });
   }
 
   async estadoCuenta(clienteId: number): Promise<Record<string, unknown>> {

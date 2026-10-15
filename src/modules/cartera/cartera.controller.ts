@@ -30,4 +30,41 @@ export class CarteraController {
   estadoCuenta(@Param('id', ParseIntPipe) id: number) {
     return this.cartera.estadoCuenta(id);
   }
+
+  @Get('resumen-pagar')
+  resumenPagar() {
+    return this.cartera.resumenPagar();
+  }
+
+  @Get('proveedores-pagar')
+  proveedoresPorPagar() {
+    return this.cartera.proveedoresPorPagar();
+  }
+
+  @Get('aging-pagar')
+  agingPagar() {
+    return this.cartera.agingPagar();
+  }
+
+  @Get('estado-cuenta-proveedor/:id')
+  estadoCuentaProveedor(@Param('id', ParseIntPipe) id: number) {
+    return this.cartera.estadoCuentaProveedor(id);
+  }
+
+  @Post('pago-proveedor')
+  registrarPagoProveedor(
+    @Body()
+    body: {
+      orden_id: number;
+      proveedor_id: number;
+      monto: number;
+      tipo: string;
+      metodo_pago: string;
+      fecha_pago: string;
+      numero_referencia?: string;
+      observaciones?: string;
+    },
+  ) {
+    return this.cartera.registrarPagoProveedor(body);
+  }
 }
