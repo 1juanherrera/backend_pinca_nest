@@ -3,6 +3,7 @@ import {
 } from '@nestjs/common';
 
 import { ItemService } from './item.service';
+import { CreateItemDto, UpdateItemDto, UpdatePrecioManualDto } from './dto/item.dto';
 
 /** Réplica fiel de ItemController (CI4) — legacy /item_general. Rutas estáticas antes de :id. */
 @Controller()
@@ -40,18 +41,18 @@ export class ItemController {
   }
 
   @Post('item_general')
-  create(@Body() body: Record<string, unknown>) {
-    return this.svc.create(body);
+  create(@Body() body: CreateItemDto) {
+    return this.svc.create(body as unknown as Record<string, unknown>);
   }
 
   @Put('item_general/:id')
-  update(@Param('id', ParseIntPipe) id: number, @Body() body: Record<string, unknown>) {
-    return this.svc.update(id, body);
+  update(@Param('id', ParseIntPipe) id: number, @Body() body: UpdateItemDto) {
+    return this.svc.update(id, body as unknown as Record<string, unknown>);
   }
 
   @Patch('item_general/:id/precio-manual')
-  updatePrecioManual(@Param('id', ParseIntPipe) id: number, @Body() body: Record<string, unknown>) {
-    return this.svc.updatePrecioManual(id, body);
+  updatePrecioManual(@Param('id', ParseIntPipe) id: number, @Body() body: UpdatePrecioManualDto) {
+    return this.svc.updatePrecioManual(id, body as unknown as Record<string, unknown>);
   }
 
   @Delete('item_general/:id')

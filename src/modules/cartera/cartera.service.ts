@@ -299,11 +299,11 @@ export class CarteraService {
 
   async registrarPagoProveedor(dto: {
     orden_id: number;
-    proveedor_id: number;
+    proveedor_id?: number;
     monto: number;
-    tipo: string;
+    tipo?: string;
     metodo_pago: string;
-    fecha_pago: string;
+    fecha_pago?: string;
     numero_referencia?: string;
     observaciones?: string;
   }): Promise<Record<string, unknown>> {

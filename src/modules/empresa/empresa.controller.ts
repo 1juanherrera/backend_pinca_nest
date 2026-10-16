@@ -12,6 +12,7 @@ import {
 import { FileInterceptor } from '@nestjs/platform-express';
 
 import { EmpresaService } from './empresa.service';
+import { UpdateEmpresaDto } from './dto/empresa.dto';
 import { CurrentUser, JwtUser } from '../../common/decorators/current-user.decorator';
 
 /** Réplica de EmpresaController (CI4) — datos + logo. */
@@ -30,8 +31,8 @@ export class EmpresaController {
   }
 
   @Put()
-  update(@CurrentUser() user: JwtUser, @Body() body: Record<string, unknown>) {
-    return this.empresa.update(user, body);
+  update(@CurrentUser() user: JwtUser, @Body() body: UpdateEmpresaDto) {
+    return this.empresa.update(user, body as unknown as Record<string, unknown>);
   }
 
   @Post('logo')

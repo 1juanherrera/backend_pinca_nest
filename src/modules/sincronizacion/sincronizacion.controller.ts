@@ -17,6 +17,7 @@ import {
 import { SincronizacionService } from './sincronizacion.service';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { ActualizarClusterDto, IaClasificarDto, MergeDto, MoverItemClusterDto } from './dto/sincronizacion.dto';
 
 /**
  * Réplica fiel de SincronizacionController (endpoints NO-IA, CI4).
@@ -70,15 +71,12 @@ export class SincronizacionController {
   @Roles('admin', 'superadmin')
   @HttpCode(200)
   async merge(
-    @Body() body: { keep_id?: number; remove_id?: number },
+    @Body() body: MergeDto,
     @CurrentUser('username') username: string,
     @CurrentUser('rol') rol: string,
   ) {
-    const keepId = Number(body.keep_id ?? 0);
-    const removeId = Number(body.remove_id ?? 0);
-    if (keepId <= 0 || removeId <= 0) {
-      throw new BadRequestException('keep_id y remove_id son requeridos.');
-    }
+    const keepId = body.keep_id;
+    const removeId = body.remove_id;
     const detalle = await this.sinc.merge(keepId, removeId);
     this.logger.log(
       `[MERGE_ITEMS] keep=${keepId} remove=${removeId} por ${username} (${rol})`,
@@ -91,7 +89,7 @@ export class SincronizacionController {
   @HttpCode(200)
   async iaClasificar(
     @CurrentUser('rol') rol: string,
-    @Body() body: Record<string, unknown>,
+    @Body() body: IaClasificarDto,
   ) {
     if (!['admin', 'superadmin'].includes(rol)) {
       throw new HttpException(
@@ -99,8 +97,7 @@ export class SincronizacionController {
         403,
       );
     }
-    const tipo =
-      body?.tipo !== undefined && body.tipo !== '' ? Math.trunc(Number(body.tipo)) : null;
+    const tipo = body.tipo ?? null;
     try {
       return await this.sinc.iaClasificar(tipo);
     } catch (e) {
@@ -135,9 +132,9 @@ export class SincronizacionController {
   @Roles('admin', 'superadmin')
   async actualizarCluster(
     @Param('id', ParseIntPipe) id: number,
-    @Body() body: Record<string, unknown>,
+    @Body() body: ActualizarClusterDto,
   ) {
-    const cluster = await this.sinc.actualizarCluster(id, body);
+    const cluster = await this.sinc.actualizarCluster(id, body as unknown as Record<string, unknown>);
     return { message: 'Cluster actualizado.', cluster };
   }
 
@@ -145,9 +142,9 @@ export class SincronizacionController {
   @Roles('admin', 'superadmin')
   async moverItem(
     @Param('id', ParseIntPipe) id: number,
-    @Body() body: { rol?: string },
+    @Body() body: MoverItemClusterDto,
   ) {
-    await this.sinc.moverItem(id, String(body.rol ?? ''));
+    await this.sinc.moverItem(id, body.rol ?? '');
     return { message: 'Miembro actualizado.' };
   }
 

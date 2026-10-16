@@ -1,6 +1,7 @@
 import { Body, Controller, Get, Param, ParseIntPipe, Post } from '@nestjs/common';
 
 import { CarteraService } from './cartera.service';
+import { CrearSaldoInicialDto, RegistrarPagoProveedorDto } from './dto/cartera.dto';
 
 @Controller('cartera')
 export class CarteraController {
@@ -22,7 +23,7 @@ export class CarteraController {
   }
 
   @Post('saldo-inicial')
-  crearSaldoInicial(@Body() body: { cliente_id: number; total: number; observaciones?: string; fecha_emision?: string; fecha_vencimiento?: string }) {
+  crearSaldoInicial(@Body() body: CrearSaldoInicialDto) {
     return this.cartera.crearSaldoInicial(body);
   }
 
@@ -52,19 +53,7 @@ export class CarteraController {
   }
 
   @Post('pago-proveedor')
-  registrarPagoProveedor(
-    @Body()
-    body: {
-      orden_id: number;
-      proveedor_id: number;
-      monto: number;
-      tipo: string;
-      metodo_pago: string;
-      fecha_pago: string;
-      numero_referencia?: string;
-      observaciones?: string;
-    },
-  ) {
+  registrarPagoProveedor(@Body() body: RegistrarPagoProveedorDto) {
     return this.cartera.registrarPagoProveedor(body);
   }
 }

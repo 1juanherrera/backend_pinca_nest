@@ -19,6 +19,7 @@ import {
   RecibirLineaDto,
   UpdateOrdenCompraDto,
 } from './dto/orden-compra.dto';
+import { RecibirProrrateadoDto } from './dto/recibir-prorrateado.dto';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
 
@@ -73,10 +74,10 @@ export class OrdenesCompraController {
   @HttpCode(200)
   recibirProrrateado(
     @Param('id', ParseIntPipe) id: number,
-    @Body() body: Record<string, unknown>,
+    @Body() body: RecibirProrrateadoDto,
     @CurrentUser('username') username: string,
   ) {
-    return this.oc.recibirLoteProrrateado(id, body, username);
+    return this.oc.recibirLoteProrrateado(id, body as unknown as Record<string, unknown>, username);
   }
 
   @Put(':id')

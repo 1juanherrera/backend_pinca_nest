@@ -14,6 +14,7 @@ import { Roles } from '../../common/decorators/roles.decorator';
 
 import { RemisionesService } from './remisiones.service';
 import { CreateRemisionDto, UpdateRemisionDto } from './dto/remision.dto';
+import { CambiarEstadoRemisionDto } from './dto/cambiar-estado.dto';
 
 /**
  * Réplica fiel de RemisionesController (CI4) — parte SAFE-NOW.
@@ -51,8 +52,8 @@ export class RemisionesController {
   }
 
   @Patch(':id/estado')
-  cambiarEstado(@Param('id', ParseIntPipe) id: number, @Body() body: Record<string, unknown>) {
-    return this.remisiones.cambiarEstado(id, body);
+  cambiarEstado(@Param('id', ParseIntPipe) id: number, @Body() body: CambiarEstadoRemisionDto) {
+    return this.remisiones.cambiarEstado(id, body as unknown as Record<string, unknown>);
   }
 
   @Put(':id')

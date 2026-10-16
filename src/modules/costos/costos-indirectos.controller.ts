@@ -3,6 +3,7 @@ import {
 } from '@nestjs/common';
 
 import { CostosIndirectosService } from './costos-indirectos.service';
+import { AsignarCostoIndirectoItemDto, CreateCostoIndirectoDto, UpdateCostoIndirectoDto } from './dto/costos.dto';
 
 /** Réplica fiel de CostosIndirectosController (CI4). Rutas específicas antes de :id. */
 @Controller('costos_indirectos')
@@ -20,8 +21,8 @@ export class CostosIndirectosController {
   }
 
   @Post('item/:itemId')
-  asignarItem(@Param('itemId', ParseIntPipe) itemId: number, @Body() body: Record<string, unknown>) {
-    return this.svc.asignarItem(itemId, body);
+  asignarItem(@Param('itemId', ParseIntPipe) itemId: number, @Body() body: AsignarCostoIndirectoItemDto) {
+    return this.svc.asignarItem(itemId, body as unknown as Record<string, unknown>);
   }
 
   @Get(':id')
@@ -35,13 +36,13 @@ export class CostosIndirectosController {
   }
 
   @Post()
-  create(@Body() body: Record<string, unknown>) {
-    return this.svc.create(body);
+  create(@Body() body: CreateCostoIndirectoDto) {
+    return this.svc.create(body as unknown as Record<string, unknown>);
   }
 
   @Put(':id')
-  update(@Param('id', ParseIntPipe) id: number, @Body() body: Record<string, unknown>) {
-    return this.svc.update(id, body);
+  update(@Param('id', ParseIntPipe) id: number, @Body() body: UpdateCostoIndirectoDto) {
+    return this.svc.update(id, body as unknown as Record<string, unknown>);
   }
 
   @Delete(':id')

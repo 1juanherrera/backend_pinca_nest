@@ -9,6 +9,7 @@ import {
 
 import { ConfiguracionService } from './configuracion.service';
 import { CurrentUser, JwtUser } from '../../common/decorators/current-user.decorator';
+import { BulkUpdateConfigDto, UpdateConfigDto } from './dto/configuracion.dto';
 
 /** Réplica fiel de ConfiguracionController (CI4). Lectura: autenticado; mutaciones: admin/superadmin. */
 @Controller('configuracion')
@@ -35,13 +36,10 @@ export class ConfiguracionController {
   @Put('bulk')
   async bulkUpdate(
     @CurrentUser() user: JwtUser,
-    @Body() body: Record<string, unknown>,
+    @Body() body: BulkUpdateConfigDto,
   ) {
     this.requireAdmin(user);
-    const configs = body?.configs;
-    if (configs === null || typeof configs !== 'object' || Array.isArray(configs) || !Object.keys(configs).length) {
-      throw this.fail('Body debe contener `configs: { clave: valor, … }`.', 422);
-    }
+    const configs = body.configs;
     const aplicados: string[] = [];
     const errores: string[] = [];
     for (const [clave, valor] of Object.entries(configs)) {
@@ -97,12 +95,9 @@ export class ConfiguracionController {
   async update(
     @CurrentUser() user: JwtUser,
     @Param('clave') clave: string,
-    @Body() body: Record<string, unknown>,
+    @Body() body: UpdateConfigDto,
   ) {
     this.requireAdmin(user);
-    if (!body || !Object.prototype.hasOwnProperty.call(body, 'valor')) {
-      throw this.fail('Campo `valor` requerido.', 422);
-    }
     const ok = await this.cfg.guardar(clave, body.valor, user.username);
     if (!ok) throw this.fail(`No se pudo actualizar '${clave}'.`, 400);
     return {
